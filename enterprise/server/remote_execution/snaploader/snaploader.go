@@ -11,6 +11,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
+	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -24,12 +25,12 @@ const (
 
 type LoadSnapshotOptions struct {
 	// The following fields are all required.
-	ConfigurationData []byte
-	MemSnapshotPath   string
-	DiskSnapshotPath  string
-	KernelImagePath   string
-	InitrdImagePath   string
-	ContainerFSPath   string
+	ConfigurationData   []byte
+	MemSnapshotPath     string
+	VMStateSnapshotPath string
+	KernelImagePath     string
+	InitrdImagePath     string
+	ContainerFSPath     string
 
 	// This field is optional -- a snapshot may have a filesystem
 	// stored with it or it may have one attached at runtime.
@@ -77,7 +78,7 @@ func hardlinkFilesIntoDirectory(targetDir string, files ...string) error {
 func extractFiles(snapOpts *LoadSnapshotOptions) []string {
 	files := []string{
 		snapOpts.MemSnapshotPath,
-		snapOpts.DiskSnapshotPath,
+		snapOpts.VMStateSnapshotPath,
 		snapOpts.KernelImagePath,
 		snapOpts.InitrdImagePath,
 		snapOpts.ContainerFSPath,
@@ -154,7 +155,9 @@ func (l *Loader) UnpackSnapshot(outputDirectory string) error {
 		}
 	}
 	for filename, dk := range l.manifest.CachedFiles {
-		if !l.env.GetFileCache().FastLinkFile(fileNodeFromDigest(dk.ToDigest()), filepath.Join(outputDirectory, filename)) {
+		fp := filepath.Join(outputDirectory, filename)
+		log.Infof("Unpack %q", fp)
+		if !l.env.GetFileCache().FastLinkFile(fileNodeFromDigest(dk.ToDigest()), fp) {
 			return status.FailedPreconditionErrorf("File %q missing from snapshot.", filename)
 		}
 	}
