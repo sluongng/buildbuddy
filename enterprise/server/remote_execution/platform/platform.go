@@ -50,6 +50,7 @@ const (
 	WorkflowIDPropertyName               = "workflow-id"
 	workloadIsolationPropertyName        = "workload-isolation-type"
 	enableVFSPropertyName                = "enable-vfs"
+	HostedBazelAffinityKeyPropertyName   = "hosted-bazel-affinity-key"
 
 	operatingSystemPropertyName = "OSFamily"
 	LinuxOperatingSystemName    = "linux"
@@ -101,6 +102,7 @@ type Properties struct {
 	PersistentWorkerKey      string
 	PersistentWorkerProtocol string
 	WorkflowID               string
+	HostedBazelAffinityKey   string
 }
 
 // ContainerType indicates the type of containerization required by an executor.
@@ -150,6 +152,7 @@ func ParseProperties(task *repb.ExecutionTask) *Properties {
 		PersistentWorkerKey:       stringProp(m, persistentWorkerKeyPropertyName, ""),
 		PersistentWorkerProtocol:  stringProp(m, persistentWorkerProtocolPropertyName, ""),
 		WorkflowID:                stringProp(m, WorkflowIDPropertyName, ""),
+		HostedBazelAffinityKey:    stringProp(m, HostedBazelAffinityKeyPropertyName, ""),
 	}
 }
 
