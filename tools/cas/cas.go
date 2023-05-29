@@ -40,7 +40,25 @@ var (
 
 	showMetadata     = flag.Bool("metadata", false, "Whether to fetch and log metadata for the digest (printed to stderr).")
 	showMetadataOnly = flag.Bool("metadata_only", false, "Whether to *only* fetch metadata, not the contents. This will print the metadata to stdout instead of stderr.")
+
+	getCapabilities = flag.Bool("get_capabilities", false, "Whether to fetch and log the server's capabilities.")
 )
+
+func doGetCapabilities() error {
+	conn, err := grpc_client.DialTarget(*target)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	caps, err := repb.NewCapabilitiesClient(conn).GetCapabilities(ctx, &repb.GetCapabilitiesRequest{})
+	if err != nil {
+		return err
+	}
+
+	printMessage(caps)
+	return nil
+}
 
 // Examples:
 //
@@ -64,6 +82,13 @@ func main() {
 	if *target == "" {
 		log.Fatalf("Missing --target")
 	}
+	if *getCapabilities {
+		if err := doGetCapabilities(); err != nil {
+			log.Fatalf(status.Message(err))
+		}
+		return
+	}
+
 	if *blobDigest == "" {
 		log.Fatalf("Missing --digest")
 	}
