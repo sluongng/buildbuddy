@@ -54,6 +54,13 @@ service Execution {
 }
 ```
 
+Because this was defined in protobuf, new RPCs and messages could be introduce in a backward compatible
+manner. Old field could also be deprecated away in non-breaking fashion.
+This enables different client implementations to work with different server implementations.
+Thanks to this attribute, there are other build tools that have adopted these API standards:
+
+- ...
+
 So how does Bazel make use of these?
 
 ## Server Capabilities
@@ -88,5 +95,27 @@ message ServerCapabilities {
   build.bazel.semver.SemVer low_api_version = 4;
 
   build.bazel.semver.SemVer high_api_version = 5;
+}
+```
+
+Let's take a moment to inspect how Bazel is requesting for the capabilities by implementing a quick
+client to connect to BuildBuddy. Here, instead of implementing everything from scractch, I will
+be re-using some basic libraries inside BuildBuddy to help me out.
+
+```golang
+func doGetCapabilities() error {
+   conn, err := grpc_client.DialTarget(*target)
+   if err != nil {
+     return err
+   }
+
+   ctx := context.Background()
+   caps, err := repb.NewCapabilitiesClient(conn).GetCapabilities(ctx, &repb.GetCapabilitiesRequest{})
+   if err != nil {
+     return err
+   }
+
+   printMessage(caps)
+   return nil
 }
 ```
