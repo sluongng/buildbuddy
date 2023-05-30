@@ -14,6 +14,8 @@ tags: [bazel, technical]
 In a previous series in my blog [A Babel in Bazel](https;//google.com/), we have explored different ways Bazel caches build and test results locally.
 In this series, we shall explore the Remote APIs specification which Bazel uses for Remote Cache and Remote Build Execution.
 
+<!-- truncate -->
+
 ## Introduction
 
 Remote Execution APIs, or [Remote APIs](https;//google.com/), is an API specification that help define how a build tool should be interacting with a remote server.
