@@ -33,6 +33,7 @@ export default class Panel {
   canvasHeight = 0;
 
   filter = "";
+  selectedEvent: TraceEvent | null = null;
 
   constructor(
     readonly model: PanelModel,
@@ -397,13 +398,14 @@ export default class Panel {
 
       let color = track.colors[i];
 
+      const currentEvent = track.events[i];
       if (
         this.filter == "" ||
-        track.events[i].name.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].cat.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].args?.target?.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].args?.mnemonic?.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].out?.toLowerCase().includes(this.filter.toLowerCase())
+        currentEvent.name.toLowerCase().includes(this.filter.toLowerCase()) ||
+        currentEvent.cat.toLowerCase().includes(this.filter.toLowerCase()) ||
+        currentEvent.args?.target?.toLowerCase().includes(this.filter.toLowerCase()) ||
+        currentEvent.args?.mnemonic?.toLowerCase().includes(this.filter.toLowerCase()) ||
+        currentEvent.out?.toLowerCase().includes(this.filter.toLowerCase())
       ) {
         this.ctx.fillStyle = color;
       } else {
@@ -425,9 +427,19 @@ export default class Panel {
       this.ctx.fillRect(x, y, width, constants.TRACK_HEIGHT);
       lastEventRendered = true;
 
+      if (this.selectedEvent && this.selectedEvent === currentEvent) {
+        const originalLineWidth = this.ctx.lineWidth;
+        const originalStrokeStyle = this.ctx.strokeStyle;
+        this.ctx.strokeStyle = "red"; // Or another highly visible color
+        this.ctx.lineWidth = 2; // A thicker line for visibility
+        this.ctx.strokeRect(x, y, width, constants.TRACK_HEIGHT);
+        this.ctx.lineWidth = originalLineWidth;
+        this.ctx.strokeStyle = originalStrokeStyle;
+      }
+
       const visibleWidth = width + Math.min(0, x);
       if (visibleWidth > constants.EVENT_LABEL_WIDTH_THRESHOLD) {
-        let name = track.events[i].name;
+        let name = currentEvent.name;
         this.ctx.font = `${constants.EVENT_LABEL_FONT_SIZE} ${this.fontFamily}`;
         this.ctx.fillStyle = constants.EVENT_LABEL_FONT_COLOR;
         this.ctx.save();

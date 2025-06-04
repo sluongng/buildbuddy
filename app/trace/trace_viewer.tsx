@@ -22,6 +22,11 @@ export interface TraceViewProps {
   filterHidden?: boolean;
 }
 
+export interface TraceViewerState {
+  matchedSpans: TraceEvent[];
+  selectedSpanIndex: number;
+}
+
 // The browser starts struggling if we have a div much greater than this width
 // in pixels. For now we rely on the browser for rendering the horizontal
 // scrollbar, so we don't allow the horizontally scrollable width to exceed this
@@ -33,11 +38,16 @@ const FILTER_URL_PARAM = "timingFilter";
 /**
  * Renders an interactive trace profile viewer for an invocation.
  */
-export default class TraceViewer extends React.Component<TraceViewProps, {}> {
+export default class TraceViewer extends React.Component<TraceViewProps, TraceViewerState> {
   /*
    * NOTE: this component intentionally does not using React state.
    * Component updates are done manually by drawing to a Canvas.
    */
+
+  state: TraceViewerState = {
+    matchedSpans: [],
+    selectedSpanIndex: -1,
+  };
 
   private model = buildTraceViewerModel(this.props.profile, this.props.fitToContent);
   private rootRef = React.createRef<HTMLDivElement>();
@@ -65,6 +75,7 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
   private panning?: Panel | null;
 
   private hovercardRef = React.createRef<EventHovercard>();
+  private filterInputRef = React.createRef<HTMLInputElement>();
 
   private unobserveResize?: () => void;
 
@@ -83,6 +94,7 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
     window.addEventListener("resize", this.onWindowResize);
     window.addEventListener("mousemove", this.onWindowMouseMove);
     window.addEventListener("mouseup", this.onWindowMouseUp);
+    window.addEventListener("keydown", this.handleKeyDown);
     for (const panel of this.panels) {
       // Need to register a non-passive event listener because we may want to
       // prevent the default scrolling behavior on wheel (for scroll-to-zoom
@@ -97,9 +109,36 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
     window.removeEventListener("resize", this.onWindowResize);
     window.removeEventListener("mousemove", this.onWindowMouseMove);
     window.removeEventListener("mouseup", this.onWindowMouseUp);
+    window.removeEventListener("keydown", this.handleKeyDown);
     this.unobserveResize?.();
     document.body.style.cursor = "";
   }
+
+  private handleKeyDown = (event: KeyboardEvent) => {
+    if (event.target === this.filterInputRef.current) {
+      return;
+    }
+
+    const { matchedSpans, selectedSpanIndex } = this.state;
+
+    if (!matchedSpans.length) {
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        // Shift + Enter: Go to previous span
+        const newIndex = selectedSpanIndex <= 0 ? matchedSpans.length - 1 : selectedSpanIndex - 1;
+        this.setState({ selectedSpanIndex: newIndex });
+      } else {
+        // Enter: Go to next span
+        const newIndex = selectedSpanIndex >= matchedSpans.length - 1 ? 0 : selectedSpanIndex + 1;
+        this.setState({ selectedSpanIndex: newIndex });
+      }
+      this.scrollToSelectedSpan();
+    }
+  };
 
   private getFilter() {
     return new URLSearchParams(window.location.search).get(FILTER_URL_PARAM) || "";
@@ -121,9 +160,14 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
     this.canvasXPerModelX.max = SCROLL_WIDTH_LIMIT / this.model.xMax;
     this.canvasXPerModelX.step(dt, { threshold: 1e-9 });
 
+    const { matchedSpans, selectedSpanIndex } = this.state;
+    const selectedSpan: TraceEvent | null =
+      selectedSpanIndex !== -1 && matchedSpans.length > selectedSpanIndex ? matchedSpans[selectedSpanIndex] : null;
+
     for (const panel of this.panels) {
       panel.resize();
       panel.filter = this.getFilter();
+      panel.selectedEvent = selectedSpan;
 
       if (!this.canvasXPerModelX.isAtTarget || this.panning) {
         // If actively zooming or panning, set the panel's scrollX so that the
@@ -262,8 +306,61 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
 
   private updateFilter = (value: string) => {
     router.setQueryParam(FILTER_URL_PARAM, value);
+
+    const matchedSpans: TraceEvent[] = [];
+    if (value) {
+      const lowerCaseFilter = value.toLowerCase();
+      for (const panelModel of this.model.panels) {
+        for (const event of panelModel.events) {
+          if (event.name?.toLowerCase().includes(lowerCaseFilter)) {
+            matchedSpans.push(event);
+          }
+        }
+      }
+    }
+
+    this.setState({
+      matchedSpans,
+      selectedSpanIndex: matchedSpans.length > 0 ? 0 : -1,
+    });
+
+    this.scrollToSelectedSpan();
     this.update();
   };
+
+  private scrollToSelectedSpan() {
+    const { matchedSpans, selectedSpanIndex } = this.state;
+
+    if (selectedSpanIndex === -1 || !matchedSpans.length) {
+      return;
+    }
+
+    const selectedSpan = matchedSpans[selectedSpanIndex];
+    if (!selectedSpan || !selectedSpan.ts || !this.canvasXPerModelX.value) {
+      return;
+    }
+
+    // Calculate the target X position to center the span.
+    const targetX = selectedSpan.ts * this.canvasXPerModelX.value;
+
+    for (const panel of this.panels) {
+      const panelWidth = panel.container.clientWidth;
+      let scrollX = targetX - panelWidth / 2;
+
+      // Clamp scrollX to valid bounds
+      scrollX = Math.max(0, scrollX);
+      const maxScrollX = panel.container.scrollWidth - panelWidth;
+      scrollX = Math.min(scrollX, maxScrollX);
+
+      panel.scrollX = scrollX;
+      panel.container.scrollLeft = panel.scrollX;
+    }
+
+    // For now, vertical scrolling is not handled automatically.
+    // A future improvement could scroll to the track containing the span.
+
+    this.update();
+  }
 
   private onCanvasMouseDown(e: React.MouseEvent, panelIndex: number) {
     this.panning = this.panels[panelIndex];
@@ -294,6 +391,7 @@ export default class TraceViewer extends React.Component<TraceViewProps, {}> {
         }}>
         {!this.props.filterHidden && (
           <FilterInput
+            inputRef={this.filterInputRef}
             className="filter"
             onChange={(e) => this.updateFilter(e.target.value)}
             value={this.getFilter()}
