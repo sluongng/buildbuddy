@@ -29,7 +29,7 @@ Before we dissect specific scheduling techniques, let's trace the high-level jou
 
 2.  **Initial Handling (BuildBuddy App - `ExecutionServer`):**
     *   The request first arrives at the `ExecutionServer` in the BuildBuddy application. Its primary duty is to check if the result for this exact action already exists in the **Action Cache**. If a valid cached result is found, the `ExecutionServer` returns it immediately, saving valuable computation time.
-    *   If the action isn't cached, the `ExecutionServer` utilizes an **Action Merging** technique via a component named `ActionMerger`. This component, often backed by a distributed key-value store like Redis, checks if an identical action is already being processed elsewhere in the system. If so, the new request can subscribe to the result of the ongoing action, preventing redundant work. (We'll revisit Action Merging in more detail under "Fine-Tuning Performance").
+    *   If the action isn't cached, the `ExecutionServer` utilizes an **Action Merging** technique (which we'll explore in detail in "Optimizing Redundancy and Latency: Action Merging and Hedging") to check if an identical action is already being processed, thereby preventing redundant work.
 
 3.  **Scheduling (BuildBuddy App - `SchedulerServer`):**
     *   If the action genuinely needs execution (it's not cached and not already in flight via `ActionMerger`), the `ExecutionServer` forwards the task to the `SchedulerServer`.
@@ -130,11 +130,48 @@ This executor-initiated "pull" model complements the scheduler's initial "push" 
 *   Reduce task latency by ensuring that as soon as an executor is free, it can quickly find and start processing available work.
 *   Enhance system responsiveness and adaptability to dynamic workload changes.
 
+## Optimizing Redundancy and Latency: Action Merging and Hedging
+
+Two powerful techniques BuildBuddy employs—one to prevent redundant work and another to reduce tail latencies—are **Action Merging** and **Hedging**. These operate primarily at the `ExecutionServer` level, influencing tasks before they are even deeply enqueued or by managing how they are presented to the scheduling system.
+
+### Action Merging: Avoiding Duplicate Efforts
+The core problem Action Merging solves is straightforward: multiple clients or build steps might concurrently request the exact same action, identified by an identical **Action Digest** (a hash of the command, inputs, and properties). Without intervention, each request would be scheduled and executed independently, consuming valuable executor resources for redundant computations.
+
+BuildBuddy's `ExecutionServer`, with the help of the `ActionMerger` component, tackles this head-on:
+*   **Redis-Based Coordination:** The mechanism relies on Redis to track in-flight actions.
+    *   When a new action request arrives, its digest is used to look up a potential canonical (first-seen) **Execution ID**.
+    *   A reverse map from this Execution ID back to the Action Digest's Redis key is also maintained.
+*   **Handling New Requests:**
+    *   If a canonical Execution ID exists for the Action Digest, the `ActionMerger` checks if this execution is still considered active (e.g., by calling `schedulerService.ExistsTask` to see if the task is still known to the scheduler).
+    *   If it's active, the new request is "merged." This might involve incrementing a counter for the canonical execution, and the new request will effectively wait for the result of this ongoing canonical execution.
+    *   If no active canonical execution is found (either it never existed, or it completed/timed out), the current request initiates a *new* canonical execution. Its Execution ID is stored, and the reverse map entry is created.
+*   **Lifecycle Management:** Time-to-live (TTL) values are used for these Redis entries. When an executor successfully leases the task (via `TaskLeaser.Lease`), the TTLs on the Action Merging entries are typically updated or extended to reflect that the task is now actively being processed. Upon final completion (or permanent failure) of the action, these Redis entries are deleted.
+
+The **primary benefit** of Action Merging is substantial resource saving by preventing the system from executing the same computationally expensive task multiple times simultaneously. This is controlled by the flag `remote_execution.enable_action_merging`, which defaults to true.
+
+### Hedging: Racing for Faster Results
+While Action Merging prevents unnecessary duplicate work, it can introduce a new challenge: if the single, canonical execution of an action gets stuck on a particularly slow or misbehaving executor, all merged requests waiting for its result will also be delayed. This can impact **tail latency**—the small percentage of requests that take much longer than average.
+
+**Hedging** is an enhancement to Action Merging designed to mitigate this risk. It allows the system to proactively start additional, concurrent copies of an action if the canonical one seems to be taking too long.
+
+*   **`shouldHedge` Logic:** The decision to hedge is made when `FindPendingExecution` (part of the `ActionMerger`'s lookup process for a canonical execution) is called. It's based on two main configuration parameters:
+    *   `remote_execution.action_merging_hedge_count`: This determines the maximum number of *additional* (hedged) copies of an action that can be started. A value of 0 (the default) disables hedging.
+    *   `remote_execution.action_merging_hedge_delay`: This specifies the minimum delay required after the *last* submitted execution (canonical or a previous hedge) before a new hedged copy can be initiated. This delay often incorporates a linear backoff, meaning subsequent hedges for the same action will wait progressively longer.
+*   **Initiating Hedged Executions:** If `shouldHedge` evaluates to true (i.e., hedging is enabled, the max hedge count hasn't been reached, and the required delay has passed), a new execution task is initiated for the same action. An internal counter, `hedgedExecutionCount`, stored in the Redis hash for the action, is incremented. This new task then flows through the regular scheduling process.
+*   **The Race to Completion:** The first execution to complete successfully (whether it's the original canonical one or any of its hedged siblings) "wins." Its result is provided to all waiting requesters. Other running copies of the same action would ideally be cancelled at this point to free up resources, though the specifics of the cancellation mechanism are beyond the scope of this post. If an execution fails permanently, other copies continue to run (up to their own retry limits).
+
+The **primary benefit** of Hedging is that it mitigates the risk posed by slow or stuck executors, leading to more predictable and often faster overall action completion times, particularly for tasks that might otherwise fall into the tail end of the latency distribution. Hedging requires Action Merging to be enabled and is controlled by `remote_execution.action_merging_hedge_count` and `remote_execution.action_merging_hedge_delay`.
+
+### Action Merging vs. Hedging: A Quick Summary
+It's important to distinguish between these two related but distinct features:
+*   **Action Merging:** Aims to *prevent unnecessary duplicate executions* of identical actions by making subsequent requests wait for the outcome of the first (canonical) one. This saves resources.
+*   **Hedging:** Aims to *reduce latency for a given action* by intentionally launching limited, time-delayed duplicate executions to race against each other. This improves responsiveness at the cost of potentially running more than one copy for a brief period.
+
+Together, these mechanisms help BuildBuddy optimize for both resource efficiency and reduced execution latency.
+
 ## Fine-Tuning Performance: Advanced Scheduling Features
 
-Beyond the core scheduling algorithms and work-stealing, BuildBuddy incorporates several other advanced features to further optimize performance and resource utilization.
-
-**Action Merging (Pre-Queue Optimization Revisited):** As introduced in our topology overview, **Action Merging** is a powerful preemptive optimization. Before a task even enters the scheduling queues, the `ExecutionServer` (via `ActionMerger`) checks for identical in-flight actions. If found, the new request subscribes to the existing result, avoiding redundant computations entirely. This is particularly effective for identical, long-running tasks submitted concurrently and significantly lessens the load on schedulers and executors by preventing these duplicates from ever needing to be scheduled.
+Beyond the core scheduling algorithms, work-stealing, and the pre-emptive optimizations of Action Merging and Hedging, BuildBuddy incorporates other advanced features to further refine performance and resource utilization.
 
 **Queue Trimming (Post-Scheduling Optimization):** In dynamic environments, an Executor might receive a task reservation (via probing or work-stealing) for a task that has, unbeknownst to it, already been completed or is definitively leased by another executor. To prevent wasted effort, Executors perform **queue trimming**. The `PriorityTaskScheduler` on each Executor includes `trimQueue` logic, allowing it to verify the status of tasks in its local queue before attempting to lease or execute them. If a task is already done or irrevocably claimed elsewhere, it's safely dropped, freeing local capacity sooner.
 
@@ -146,7 +183,7 @@ These advanced features showcase the intricate level of detail necessary for bui
 
 As we've journeyed through BuildBuddy's task scheduling landscape, it's clear that managing tasks in a large-scale distributed system is far more complex than a simple First-In-First-Out queue. It demands a sophisticated interplay of various techniques, all harmonized to maximize efficiency, ensure fairness, maintain reliability, and deliver a responsive experience for users.
 
-We've seen how **Priority-Based Grouped Queueing** ensures equitable resource distribution, while **Resource-Aware Scheduling** and **Dynamic Task Sizing** optimize executor capacity. The critical **Task Leasing and Reconnection** mechanism underpins reliability, and **Intelligent Affinity and CI Runner Routing** accelerate execution by leveraging data locality. Furthermore, the proactive **Work-Stealing** model allows idle executors to actively pull tasks, enhancing resource utilization and responsiveness. Finally, advanced optimizations like **Action Merging**, **Queue Trimming**, and intelligent **Custom Resource Handling** fine-tune performance in dynamic environments. Each of these elements plays an indispensable role.
+We've seen how **Priority-Based Grouped Queueing** ensures equitable resource distribution, while **Resource-Aware Scheduling** and **Dynamic Task Sizing** optimize executor capacity. The critical **Task Leasing and Reconnection** mechanism underpins reliability, and **Intelligent Affinity and CI Runner Routing** accelerate execution by leveraging data locality. The proactive **Work-Stealing** model allows idle executors to actively pull tasks. Techniques like **Action Merging and Hedging** optimize for redundancy and latency even before tasks are deeply queued. Finally, other advanced optimizations like **Queue Trimming** and intelligent **Custom Resource Handling** further fine-tune performance in dynamic environments. Each of these elements plays an indispensable role.
 
 Collectively, these strategies forge a distributed build system that is not only powerful and scalable but also remarkably resilient to fluctuating workloads and the inevitable perturbations of a distributed environment. The ultimate aim is always to complete builds and tests as quickly and reliably as possible, and sophisticated scheduling, encompassing both server-pushed task probing and executor-pulled work-stealing, is a cornerstone of this mission.
 
