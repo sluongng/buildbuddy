@@ -1,7 +1,8 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, HelpCircle } from "lucide-react";
 import React from "react";
 import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import { TextLink } from "../components/link/link";
+import { Tooltip } from "../components/tooltip/tooltip";
 import InvocationModel from "../invocation/invocation_model";
 import router from "../router/router";
 import {
@@ -257,7 +258,17 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
   }
 
   private getActionText(action: CompactExecLogActionSummary): string {
-    return action.cached ? `${action.label} (Cached)` : action.label;
+    return action.label;
+  }
+
+  private renderActionStatusChip(action: CompactExecLogActionSummary): React.ReactNode {
+    if (action.result === "failed") {
+      return <span className="target-edge-status-chip failure">Failed</span>;
+    }
+    if (action.cached) {
+      return <span className="target-edge-status-chip cached">Cached</span>;
+    }
+    return null;
   }
 
   private renderTargetLink(targetLabel: string) {
@@ -275,6 +286,7 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
     }
     return (
       <TextLink
+        plain
         className="target-edge-inline-link target-edge-target-label"
         href={this.getTargetHref(targetLabel)}
         title={targetLabel}
@@ -298,6 +310,7 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
     }
     return (
       <TextLink
+        plain
         className="target-edge-inline-link target-edge-action-link"
         href={href}
         onClick={this.stopAccordionToggle}
@@ -308,14 +321,13 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
   }
 
   private renderCombinedActionLabel(action: CompactExecLogActionSummary) {
-    const actionStatusClass = getActionStatusClass(action);
     return (
       <span className="target-edge-action-summary">
-        <span className={`target-edge-result-indicator ${actionStatusClass}`} />
         <span className="target-edge-combined-label">
           {this.renderTargetLink(action.targetLabel)}
-          <span className="target-edge-arrow">{" -> "}</span>
+          <ChevronRight className="icon target-edge-breadcrumb-separator" />
           {this.renderActionLink(action)}
+          {this.renderActionStatusChip(action)}
         </span>
       </span>
     );
@@ -349,12 +361,11 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
     const parents = this.getRelatedActions(action, "parents");
     const children = this.getRelatedActions(action, "children");
     const Chevron = expanded ? ChevronDown : ChevronRight;
-    const actionStatusClass = getActionStatusClass(action);
 
     return (
       <div className={`target-edges-accordion-item ${expanded ? "expanded" : ""}`} key={action.id}>
         <div
-          className={`target-edges-accordion-header ${actionStatusClass}`}
+          className="target-edges-accordion-header"
           onClick={() => this.toggleExpandedAction(action.id)}
           onKeyDown={(event) => this.handleAccordionKeyDown(event, action.id)}
           ref={(element) => this.setActionHeaderRef(action.id, element)}
@@ -368,8 +379,8 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
         {expanded && (
           <div className="target-edges-accordion-body">
             <div className="target-edges-accordion-sections">
-              {this.renderRelatedActionsSection("Parent actions", parents, "No upstream actions found.")}
-              {this.renderRelatedActionsSection("Child actions", children, "No downstream actions found.")}
+              {this.renderRelatedActionsSection("Dependencies", parents, "No dependencies found.")}
+              {this.renderRelatedActionsSection("Dependents", children, "No dependents found.")}
             </div>
           </div>
         )}
@@ -400,9 +411,26 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
         <div className="content">
           <div className="invocation-content-header target-edges-header">
             <div>
-              <div className="title">Build graph edges</div>
+              <div className="title">
+                <span>Deps</span>
+                <Tooltip
+                  className="target-edges-help-tooltip"
+                  renderContent={() => (
+                    <div className="target-edges-hovercard">
+                      <div>
+                        <p>
+                          <b>Deps</b>
+                        </p>
+                        <p>Each row is an action for this target.</p>
+                        <p>Expand a row to see the actions it depends on and the actions that depend on it.</p>
+                      </div>
+                    </div>
+                  )}>
+                  <HelpCircle className="icon target-edges-help-icon" />
+                </Tooltip>
+              </div>
               <div className="target-edges-subtitle">
-                Expand an action to inspect its parent and child actions from the compact execution log.
+                Expand an action to see the actions it needs and the actions that use its outputs.
               </div>
             </div>
           </div>
@@ -464,13 +492,6 @@ function compareActionSummaries(a: CompactExecLogActionSummary, b: CompactExecLo
 function getBuildEventFilePath(file: build_event_stream.File): string | undefined {
   const components = [...(file.pathPrefix || []), file.name || ""].filter(Boolean);
   return components.length ? components.join("/") : undefined;
-}
-
-function getActionStatusClass(action: CompactExecLogActionSummary): "cached" | "failure" | "success" {
-  if (action.result === "failed") {
-    return "failure";
-  }
-  return action.cached ? "cached" : "success";
 }
 
 const MAX_TARGET_LABEL_LENGTH = 48;

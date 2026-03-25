@@ -364,7 +364,7 @@ export default class TargetV2Component extends React.Component<TargetProps, Stat
       sectionTabs.push({ id: "executions", label: "Executions" });
     }
     if (this.props.model.hasExecutionLog()) {
-      sectionTabs.push({ id: "edges", label: "Edges" });
+      sectionTabs.push({ id: "edges", label: "Deps" });
     }
     const sectionFromHash = this.getSectionFromHash();
     const activeSection = sectionTabs.some((tab) => tab.id === sectionFromHash) ? sectionFromHash : "all";

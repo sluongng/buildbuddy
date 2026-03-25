@@ -244,6 +244,7 @@ ts_library(
         "//:node_modules/react",
         "//:node_modules/tslib",
         "//app/components/link",
+        "//app/components/tooltip",
         "//app/invocation:invocation_model",
         "//app/router",
         "//app/target:compact_exec_log_edges",
