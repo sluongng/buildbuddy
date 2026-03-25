@@ -335,12 +335,29 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
 
   private renderRelatedActionsSection(
     title: string,
+    tooltipText: string,
     actions: CompactExecLogActionSummary[],
     emptyState: string
   ): React.ReactNode {
     return (
       <div className="target-edges-accordion-section">
-        <div className="target-edges-accordion-section-title">{title}</div>
+        <div className="target-edges-accordion-section-title">
+          <span>{title}</span>
+          <Tooltip
+            className="target-edges-help-tooltip"
+            renderContent={() => (
+              <div className="target-edges-hovercard">
+                <div>
+                  <p>
+                    <b>{title}</b>
+                  </p>
+                  <p>{tooltipText}</p>
+                </div>
+              </div>
+            )}>
+            <HelpCircle className="icon target-edges-help-icon" />
+          </Tooltip>
+        </div>
         {actions.length ? (
           <div className="target-edges-related-actions">
             {actions.map((action) => (
@@ -379,8 +396,18 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
         {expanded && (
           <div className="target-edges-accordion-body">
             <div className="target-edges-accordion-sections">
-              {this.renderRelatedActionsSection("Dependencies", parents, "No dependencies found.")}
-              {this.renderRelatedActionsSection("Dependents", children, "No dependents found.")}
+              {this.renderRelatedActionsSection(
+                "Dependencies",
+                "These actions produce inputs that this action needs.",
+                parents,
+                "No dependencies found."
+              )}
+              {this.renderRelatedActionsSection(
+                "Dependents",
+                "These actions consume outputs produced by this action.",
+                children,
+                "No dependents found."
+              )}
             </div>
           </div>
         )}
