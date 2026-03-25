@@ -378,6 +378,7 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
     const parents = this.getRelatedActions(action, "parents");
     const children = this.getRelatedActions(action, "children");
     const Chevron = expanded ? ChevronDown : ChevronRight;
+    const actionSubject = formatActionTooltipSubject(action);
 
     return (
       <div className={`target-edges-accordion-item ${expanded ? "expanded" : ""}`} key={action.id}>
@@ -398,13 +399,13 @@ export default class TargetEdgesCardComponent extends React.Component<Props, Sta
             <div className="target-edges-accordion-sections">
               {this.renderRelatedActionsSection(
                 "Dependencies",
-                "These actions produce inputs that this action needs.",
+                `Each listed action produces outputs that become inputs to ${actionSubject}.`,
                 parents,
                 "No dependencies found."
               )}
               {this.renderRelatedActionsSection(
                 "Dependents",
-                "These actions consume outputs produced by this action.",
+                `${actionSubject} produces outputs that become inputs to each listed action.`,
                 children,
                 "No dependents found."
               )}
@@ -519,6 +520,13 @@ function compareActionSummaries(a: CompactExecLogActionSummary, b: CompactExecLo
 function getBuildEventFilePath(file: build_event_stream.File): string | undefined {
   const components = [...(file.pathPrefix || []), file.name || ""].filter(Boolean);
   return components.length ? components.join("/") : undefined;
+}
+
+function formatActionTooltipSubject(action: CompactExecLogActionSummary): string {
+  if (action.targetLabel) {
+    return `${action.targetLabel} > ${action.label}`;
+  }
+  return action.label;
 }
 
 const MAX_TARGET_LABEL_LENGTH = 48;
