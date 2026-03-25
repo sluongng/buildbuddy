@@ -236,7 +236,18 @@
   max-width: 100%;
   pointer-events: auto;
   position: relative;
+  text-decoration-color: var(--color-link);
+  text-decoration-thickness: 1px;
   z-index: 2;
+}
+
+.target-edge-inline-link.text-link.plain:not(:hover) {
+  color: var(--color-text-primary);
+}
+
+.target-edge-inline-link:hover {
+  color: var(--color-link-hover);
+  text-decoration-color: currentColor;
 }
 
 .target-edge-target-label {
@@ -260,13 +271,13 @@
 }
 
 .target-edge-inline-link-disabled {
-  color: var(--color-link-plain);
+  color: var(--color-text-secondary);
   cursor: default;
-  text-decoration: underline;
+  text-decoration: none;
 }
 
 .target-edge-current-target {
-  color: var(--color-text-primary);
+  color: var(--color-text-secondary);
   font-weight: 600;
 }
 
