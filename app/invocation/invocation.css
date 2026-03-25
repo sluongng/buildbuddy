@@ -108,12 +108,13 @@
 
 .target-edges-hovercard {
   margin: 12px;
-  background: var(--color-cache-hovercard-bg);
+  background: var(--color-settings-hovercard-bg);
+  border: 1px solid var(--color-border-primary);
   border-radius: 8px;
+  color: var(--color-hovercard-text);
   padding: 12px;
   box-shadow: 0 1px 3px var(--color-shadow-strong);
   font-size: 14px;
-  backdrop-filter: blur(3px);
   display: flex;
   max-width: 320px;
 }
