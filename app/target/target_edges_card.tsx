@@ -495,6 +495,9 @@ function compareLabels(a: string, b: string): number {
 }
 
 function compareRelatedActions(a: CompactExecLogActionSummary, b: CompactExecLogActionSummary): number {
+  if (a.cached !== b.cached) {
+    return Number(a.cached) - Number(b.cached);
+  }
   const targetCmp = compareLabels(a.targetLabel || "", b.targetLabel || "");
   if (targetCmp !== 0) {
     return targetCmp;
