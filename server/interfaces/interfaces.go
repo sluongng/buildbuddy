@@ -1010,6 +1010,7 @@ type SchedulerService interface {
 	RegisterAndStreamWork(stream scpb.Scheduler_RegisterAndStreamWorkServer) error
 	LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 	ScheduleTask(ctx context.Context, req *scpb.ScheduleTaskRequest) (*scpb.ScheduleTaskResponse, error)
+	EnsureTask(ctx context.Context, req *scpb.EnsureTaskRequest) (*scpb.EnsureTaskResponse, error)
 	CancelTask(ctx context.Context, taskID string) (bool, error)
 	ExistsTask(ctx context.Context, taskID string) (bool, error)
 	EnqueueTaskReservation(ctx context.Context, req *scpb.EnqueueTaskReservationRequest) (*scpb.EnqueueTaskReservationResponse, error)

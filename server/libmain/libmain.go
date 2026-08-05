@@ -62,6 +62,7 @@ import (
 	cppb "github.com/buildbuddy-io/buildbuddy/proto/cache_proxy"
 	cspb "github.com/buildbuddy-io/buildbuddy/proto/cache_service"
 	enpb "github.com/buildbuddy-io/buildbuddy/proto/encryption"
+	graphpb "github.com/buildbuddy-io/buildbuddy/proto/graph_execution"
 	hitpb "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker"
 	irpb "github.com/buildbuddy-io/buildbuddy/proto/iprules"
 	ofpb "github.com/buildbuddy-io/buildbuddy/proto/oci_fetcher"
@@ -305,6 +306,9 @@ func registerServices(env *real_environment.RealEnv, grpcServer *grpc.Server) {
 	}
 	if rexec := env.GetRemoteExecutionService(); rexec != nil {
 		repb.RegisterExecutionServer(grpcServer, rexec)
+		if graphExec, ok := rexec.(graphpb.GraphExecutionServer); ok {
+			graphpb.RegisterGraphExecutionServer(grpcServer, graphExec)
+		}
 	}
 	if scheduler := env.GetSchedulerService(); scheduler != nil {
 		scpb.RegisterSchedulerServer(grpcServer, scheduler)

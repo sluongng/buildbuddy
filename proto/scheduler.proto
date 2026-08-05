@@ -399,6 +399,46 @@ message ScheduleTaskResponse {
   // Intentionally left blank.
 }
 
+// Idempotently schedules a task for a durable coordinator.
+//
+// The immutable task identity is:
+//
+//   SHA-256(
+//     uint64_be(len(serialized_task)) || serialized_task ||
+//     uint64_be(len(deterministic_proto(metadata))) ||
+//     deterministic_proto(metadata))
+//
+// serialized_task is hashed exactly as supplied. Semantically equivalent task
+// protos with different wire serializations therefore do not match.
+//
+// If task_id names an active task with the same fingerprint, the scheduler
+// preserves all mutable task state and its existing TTL, marks the task as
+// durable, and returns created=false and completed=false. It reissues a
+// reservation only when the task is unclaimed (to recover a lost reservation);
+// a claimed task receives no duplicate reservation. If task_id is bound to a
+// different fingerprint, the RPC fails with ALREADY_EXISTS without modifying
+// the task.
+//
+// Finalization of a durable task retains a bounded completion tombstone bound
+// to this fingerprint. A retry matching that tombstone succeeds with
+// EnsureTaskResponse.completed=true and does not issue a reservation.
+message EnsureTaskRequest {
+  string task_id = 1;
+  SchedulingMetadata metadata = 2;
+
+  // Serialized build.bazel.remote.execution.v2.ExecutionTask.
+  bytes serialized_task = 3;
+}
+
+message EnsureTaskResponse {
+  // True only if this call created an active task.
+  bool created = 1;
+
+  // True only if the same durable task has already completed. No reservation
+  // is issued and created is false.
+  bool completed = 2;
+}
+
 message ReEnqueueTaskRequest {
   string task_id = 1;
   // Optional reason for the re-enqueue (may be visible to end-user).
@@ -520,6 +560,10 @@ service Scheduler {
   rpc TaskExists(TaskExistsRequest) returns (TaskExistsResponse) {}
 
   rpc ScheduleTask(ScheduleTaskRequest) returns (ScheduleTaskResponse) {}
+
+  // Idempotently creates or reissues a durable task. See EnsureTaskRequest for
+  // identity, mismatch, mutable-state, TTL, and completion semantics.
+  rpc EnsureTask(EnsureTaskRequest) returns (EnsureTaskResponse) {}
 
   rpc ReEnqueueTask(ReEnqueueTaskRequest) returns (ReEnqueueTaskResponse) {}
 

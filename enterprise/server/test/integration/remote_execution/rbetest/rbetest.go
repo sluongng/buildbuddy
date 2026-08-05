@@ -96,6 +96,7 @@ import (
 	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	ctxpb "github.com/buildbuddy-io/buildbuddy/proto/context"
 	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
+	graphpb "github.com/buildbuddy-io/buildbuddy/proto/graph_execution"
 	iprpb "github.com/buildbuddy-io/buildbuddy/proto/iprules"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -149,6 +150,10 @@ func (r *Env) GetBuildBuddyServiceClient() bbspb.BuildBuddyServiceClient {
 
 func (r *Env) GetRemoteExecutionClient() repb.ExecutionClient {
 	return repb.NewExecutionClient(r.appProxyConn)
+}
+
+func (r *Env) GetGraphExecutionClient() graphpb.GraphExecutionClient {
+	return graphpb.NewGraphExecutionClient(r.appProxyConn)
 }
 
 func (r *Env) GetRemoteExecutionTarget() string {
@@ -485,6 +490,9 @@ func (s *BuildBuddyServer) start() {
 	s.env.SetSchedulerService(s.schedulerServer)
 	scpb.RegisterSchedulerServer(grpcServer, s.schedulerServer)
 	repb.RegisterExecutionServer(grpcServer, s.executionServer)
+	if graphExecutionServer, ok := s.executionServer.(graphpb.GraphExecutionServer); ok {
+		graphpb.RegisterGraphExecutionServer(grpcServer, graphExecutionServer)
+	}
 	repb.RegisterCapabilitiesServer(grpcServer, s.capabilitiesServer)
 	bbspb.RegisterBuildBuddyServiceServer(grpcServer, s.buildBuddyServiceServer)
 	pepb.RegisterPublishBuildEventServer(grpcServer, s.buildEventServer)
@@ -738,6 +746,9 @@ type ExecutorOptions struct {
 	CacheConn grpc.ClientConnInterface
 	// Optional interceptor for command execution results.
 	RunInterceptor
+	// Optional observer invoked when this executor starts acquiring a runner
+	// for a scheduled task. The observer must be concurrency-safe.
+	ScheduledTaskObserver        func(*repb.ScheduledTask)
 	priorityTaskSchedulerOptions priority_task_scheduler.Options
 }
 
@@ -799,6 +810,42 @@ func (r *Env) RemoveBuildBuddyServer(server *BuildBuddyServer) {
 	server.env.GetHealthChecker().WaitForGracefulShutdown()
 	delete(r.buildBuddyServers, server)
 	r.updateAppProxy()
+}
+
+// CrashBuildBuddyServer simulates abrupt loss of an app process. New proxy
+// traffic must be routed away from server before calling this method.
+//
+// This intentionally skips the app health checker's graceful callbacks. It
+// synchronously stops app-owned graph coordinators without releasing their
+// durable leases. A replacement app must wait for lease expiry and fence the
+// old epoch, just as it would after real process death.
+func (r *Env) CrashBuildBuddyServer(server *BuildBuddyServer) {
+	type graphExecutionCrasher interface {
+		CrashGraphExecution()
+	}
+	crasher, ok := server.executionServer.(graphExecutionCrasher)
+	if !ok {
+		assert.FailNow(r.t, "execution server does not support graph coordinator crash")
+	}
+	server.Stop()
+	crasher.CrashGraphExecution()
+	delete(r.buildBuddyServers, server)
+	r.t.Cleanup(func() {
+		server.env.GetHealthChecker().Shutdown()
+		server.env.GetHealthChecker().WaitForGracefulShutdown()
+	})
+}
+
+// SetGraphRecoveredWaiterSubscribedHook installs a test-only callback that is
+// invoked after this app has reconstructed a durable graph node and attached
+// its replacement WaitExecution subscription.
+func (s *BuildBuddyServer) SetGraphRecoveredWaiterSubscribedHook(hook func(executionID string)) {
+	type recoveredWaiterObserver interface {
+		SetGraphRecoveredWaiterSubscribedHookForTesting(func(executionID string))
+	}
+	observer, ok := s.executionServer.(recoveredWaiterObserver)
+	require.True(s.t, ok, "execution server does not support recovered waiter observation")
+	observer.SetGraphRecoveredWaiterSubscribedHookForTesting(hook)
 }
 
 // Updates the app proxy to route requests to a random, running app.
@@ -922,7 +969,8 @@ func (r *Env) addExecutor(t testing.TB, options *ExecutorOptions) *Executor {
 	}
 
 	runnerPool := NewTestRunnerPool(r.t, env, localCacheDirectory, TestRunnerOverrides{
-		RunInterceptor: options.RunInterceptor,
+		RunInterceptor:        options.RunInterceptor,
+		ScheduledTaskObserver: options.ScheduledTaskObserver,
 	})
 
 	exec, err := executor.NewExecutor(env, executorID, executorHostID, "fake-host-name", runnerPool)
@@ -1480,14 +1528,16 @@ func DownloadInputsNoop(ctx context.Context, ioStats *repb.IOStats) error {
 // test.
 type testRunnerPool struct {
 	interfaces.RunnerPool
-	runInterceptor      RunInterceptor
-	recycleInterceptor  RecycleInterceptor
-	postCompletionStats *espb.PostCompletionStats
+	runInterceptor        RunInterceptor
+	recycleInterceptor    RecycleInterceptor
+	postCompletionStats   *espb.PostCompletionStats
+	scheduledTaskObserver func(*repb.ScheduledTask)
 }
 
 type TestRunnerOverrides struct {
-	RunInterceptor     RunInterceptor
-	RecycleInterceptor RecycleInterceptor
+	RunInterceptor        RunInterceptor
+	RecycleInterceptor    RecycleInterceptor
+	ScheduledTaskObserver func(*repb.ScheduledTask)
 	// PostCompletionStats, if not nil, is returned from the test runner's
 	// PostCompletionStats() method.
 	PostCompletionStats *espb.PostCompletionStats
@@ -1496,10 +1546,19 @@ type TestRunnerOverrides struct {
 func NewTestRunnerPool(t testing.TB, env environment.Env, cacheRoot string, opts TestRunnerOverrides) interfaces.RunnerPool {
 	realPool, err := runner.NewPool(env, cacheRoot, &runner.PoolOptions{})
 	require.NoError(t, err)
-	return &testRunnerPool{realPool, opts.RunInterceptor, opts.RecycleInterceptor, opts.PostCompletionStats}
+	return &testRunnerPool{
+		RunnerPool:            realPool,
+		runInterceptor:        opts.RunInterceptor,
+		recycleInterceptor:    opts.RecycleInterceptor,
+		postCompletionStats:   opts.PostCompletionStats,
+		scheduledTaskObserver: opts.ScheduledTaskObserver,
+	}
 }
 
 func (p *testRunnerPool) Get(ctx context.Context, task *repb.ScheduledTask) (interfaces.Runner, error) {
+	if p.scheduledTaskObserver != nil {
+		p.scheduledTaskObserver(task)
+	}
 	realRunner, err := p.RunnerPool.Get(ctx, task)
 	if err != nil {
 		return nil, err

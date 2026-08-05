@@ -811,6 +811,16 @@ proto_library(
 )
 
 proto_library(
+    name = "graph_execution_proto",
+    srcs = ["graph_execution.proto"],
+    deps = [
+        ":remote_execution_proto",
+        "@com_google_protobuf//:duration_proto",
+        "@googleapis//google/rpc:status_proto",
+    ],
+)
+
+proto_library(
     name = "execution_graph_proto",
     srcs = [
         "execution_graph.proto",
@@ -1769,6 +1779,18 @@ go_proto_library(
         "@com_google_cloud_go_longrunning//autogen/longrunningpb",
         "@org_golang_google_genproto_googleapis_api//annotations",
         "@org_golang_google_genproto_googleapis_rpc//status",
+    ],
+)
+
+go_proto_library(
+    name = "graph_execution_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/graph_execution",
+    mode = "messages_and_services",
+    proto = ":graph_execution_proto",
+    deps = [
+        ":remote_execution_go_proto",
+        "@org_golang_google_genproto_googleapis_rpc//status",
+        "@org_golang_google_protobuf//types/known/durationpb",
     ],
 )
 

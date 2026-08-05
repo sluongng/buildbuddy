@@ -4,7 +4,11 @@ package(default_visibility = ["//enterprise:__subpackages__"])
 
 go_library(
     name = "execution_server",
-    srcs = ["execution_server.go"],
+    srcs = [
+        "execution_server.go",
+        "graph_durability.go",
+        "graph_execute.go",
+    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_server",
     deps = [
         "//enterprise/server/backends/pubsub",
@@ -18,8 +22,10 @@ go_library(
         "//enterprise/server/util/execution",
         "//proto:build_event_stream_go_proto",
         "//proto:execution_stats_go_proto",
+        "//proto:graph_execution_go_proto",
         "//proto:invocation_status_go_proto",
         "//proto:remote_execution_go_proto",
+        "//proto:resource_go_proto",
         "//proto:scheduler_go_proto",
         "//proto:stored_invocation_go_proto",
         "//server/environment",
@@ -58,6 +64,7 @@ go_library(
         "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_google_cloud_go_longrunning//autogen/longrunningpb",
+        "@org_golang_google_genproto_googleapis_rpc//status",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//metadata",
         "@org_golang_google_grpc//status",
@@ -70,7 +77,10 @@ go_library(
 go_test(
     name = "execution_server_test",
     size = "small",
-    srcs = ["execution_server_test.go"],
+    srcs = [
+        "execution_server_test.go",
+        "graph_execute_test.go",
+    ],
     deps = [
         ":execution_server",
         "//enterprise/server/backends/redis_execution_collector",
@@ -82,12 +92,14 @@ go_test(
         "//enterprise/server/util/execution",
         "//enterprise/server/util/redisutil",
         "//proto:execution_stats_go_proto",
+        "//proto:graph_execution_go_proto",
         "//proto:invocation_status_go_proto",
         "//proto:remote_execution_go_proto",
         "//proto:resource_go_proto",
         "//proto:scheduler_go_proto",
         "//server/environment",
         "//server/interfaces",
+        "//server/metrics",
         "//server/real_environment",
         "//server/remote_cache/cachetools",
         "//server/remote_cache/digest",
@@ -115,6 +127,7 @@ go_test(
         "@com_github_open_feature_go_sdk//openfeature",
         "@com_github_open_feature_go_sdk//openfeature/memprovider",
         "@com_github_open_feature_go_sdk_contrib_providers_flagd//pkg",
+        "@com_github_prometheus_client_golang//prometheus/testutil",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//:grpc",
@@ -125,5 +138,23 @@ go_test(
         "@org_golang_google_protobuf//types/known/anypb",
         "@org_golang_google_protobuf//types/known/durationpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)
+
+go_test(
+    name = "graph_durability_internal_test",
+    size = "small",
+    srcs = ["graph_durability_internal_test.go"],
+    embed = [":execution_server"],
+    deps = [
+        "//enterprise/server/testutil/testredis",
+        "//proto:graph_execution_go_proto",
+        "//proto:remote_execution_go_proto",
+        "//proto:scheduler_go_proto",
+        "//server/util/proto",
+        "//server/util/status",
+        "@com_github_go_redis_redis_v8//:redis",
+        "@com_github_jonboulle_clockwork//:clockwork",
+        "@com_github_stretchr_testify//require",
     ],
 )

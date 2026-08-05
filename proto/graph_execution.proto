@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package build.bazel.remote.execution.graph.v1;
+
+import "google/protobuf/duration.proto";
+import "google/rpc/status.proto";
+import "proto/remote_execution.proto";
+
+option go_package = "github.com/buildbuddy-io/buildbuddy/proto/graph_execution";
+option java_multiple_files = true;
+option java_package = "build.bazel.remote.execution.graph.v1";
+
+// GraphExecution submits a related set of remote actions over one bidirectional
+// stream. The server may execute a node as soon as the node and all of its
+// inputs have been declared available; CommitGraph is a validation barrier,
+// not a scheduling barrier.
+service GraphExecution {
+  rpc GraphExecute(stream GraphExecuteRequest)
+      returns (stream GraphExecuteResponse);
+}
+
+message GraphExecuteRequest {
+  // Normal requests are ordered durably within the logical session, beginning
+  // at sequence 1 with BeginGraph and continuing contiguously. Retransmitting
+  // identical bytes at an existing sequence is idempotent; reusing a sequence
+  // for different bytes is invalid.
+  //
+  // ResumeGraph is the first and only sequence-0 frame on a replacement
+  // stream. Its outer session_id must equal ResumeGraph.session_id. Normal
+  // requests may follow it using their original sequence numbers.
+  string session_id = 1;
+  uint64 sequence_number = 2;
+
+  oneof payload {
+    BeginGraph begin = 10;
+    ResumeGraph resume = 11;
+    UploadedBlobs uploaded_blobs = 12;
+    ActionNode action = 13;
+    CommitGraph commit = 14;
+  }
+}
+
+message BeginGraph {
+  uint32 protocol_version = 1;
+  string instance_name = 2;
+  build.bazel.remote.execution.v2.DigestFunction.Value digest_function = 3;
+  repeated RootOutput roots = 4;
+  string invocation_id = 5;
+
+  // A cryptographically random, client-generated bearer secret used to
+  // authenticate ResumeGraph. It must contain exactly 32 bytes, must never be
+  // logged, and grants access only together with the original authenticated
+  // tenant and session_id. The server persists it before acknowledging
+  // BeginGraph and echoes it in BeginAck. Generating the token on the client
+  // permits recovery when BeginAck itself is lost: the client repeats the
+  // byte-identical sequence-1 BeginGraph, and conflicting bytes are invalid.
+  bytes resume_token = 6;
+}
+
+message ResumeGraph {
+  string session_id = 1;
+  // See BeginGraph.resume_token. Servers must bind this bearer secret to the
+  // original authenticated tenant and session_id.
+  bytes resume_token = 2;
+  // Inclusive response acknowledgement. The server replays responses whose
+  // sequence_number is greater than this value.
+  uint64 last_response_sequence = 3;
+}
+
+message RootOutput {
+  string node_id = 1;
+  string output_path = 2;
+}
+
+// UploadedBlobs is sent only after the client has completed the corresponding
+// CAS uploads. A server may verify the batch before allowing dependent nodes
+// to run and reports any absent values with MissingBlobs.
+message UploadedBlobs {
+  repeated build.bazel.remote.execution.v2.Digest digests = 1;
+}
+
+message ActionNode {
+  // node_id is stable within the graph and is not part of the REAPI Action
+  // digest. Re-declaring a node is allowed only when the bytes are identical.
+  string node_id = 1;
+
+  // Commands are inline so the graph stream replaces the command CAS
+  // find/upload round trip. The server stores the deterministically serialized
+  // Command in CAS before constructing the standard REAPI Action.
+  build.bazel.remote.execution.v2.Command command = 2;
+  repeated InputBinding inputs = 3;
+
+  // Order-only dependencies gate readiness but do not appear in the Merkle
+  // input root and therefore do not affect the standard Action digest.
+  repeated string scheduling_dependencies = 4;
+
+  google.protobuf.Duration timeout = 5;
+  bool do_not_cache = 6;
+  bytes salt = 7;
+  build.bazel.remote.execution.v2.Platform platform = 8;
+
+  bool skip_cache_lookup = 9;
+  build.bazel.remote.execution.v2.ExecutionPolicy execution_policy = 10;
+  build.bazel.remote.execution.v2.ResultsCachePolicy results_cache_policy = 11;
+  build.bazel.remote.execution.v2.RequestMetadata request_metadata = 12;
+
+  // For runtime-created spawns whose aggregate inputs cannot be represented by
+  // file bindings (for example a Bazel test runfiles tree), the client may
+  // upload the exact ordinary REAPI Merkle tree and provide its root digest.
+  // This is mutually exclusive with inputs. The server still constructs and
+  // executes the standard Action, preserving AC interoperability.
+  build.bazel.remote.execution.v2.Digest input_root_digest = 13;
+}
+
+message InputBinding {
+  // exec_path is a normalized, relative path in the action input root.
+  string exec_path = 1;
+  bool is_executable = 2;
+
+  oneof value {
+    build.bazel.remote.execution.v2.Digest source_digest = 3;
+    ProducedInput produced = 4;
+  }
+}
+
+message ProducedInput {
+  string producer_node_id = 1;
+  string output_path = 2;
+}
+
+message CommitGraph {
+  uint64 expected_action_count = 1;
+  // Optional client-computed digest of canonical node declarations.
+  bytes graph_fingerprint = 2;
+}
+
+message GraphExecuteResponse {
+  uint64 sequence_number = 1;
+  // Highest contiguous request sequence incorporated by the server.
+  uint64 ack_request_sequence = 2;
+
+  oneof payload {
+    BeginAck begin = 10;
+    MissingBlobs missing_blobs = 11;
+    NodeResult node_result = 12;
+    GraphProgress progress = 13;
+    GraphResult result = 14;
+    GraphStreamError error = 15;
+  }
+}
+
+message BeginAck {
+  // These values echo the session ID and bearer secret supplied by the client.
+  // resume_token must not be logged.
+  string session_id = 1;
+  bytes resume_token = 2;
+  uint32 protocol_version = 3;
+}
+
+message MissingBlobs {
+  repeated build.bazel.remote.execution.v2.Digest digests = 1;
+}
+
+message NodeResult {
+  string node_id = 1;
+  build.bazel.remote.execution.v2.Digest action_digest = 2;
+  build.bazel.remote.execution.v2.ExecuteResponse execute_response = 3;
+}
+
+message GraphProgress {
+  uint64 declared_nodes = 1;
+  uint64 ready_nodes = 2;
+  uint64 running_nodes = 3;
+  uint64 completed_nodes = 4;
+}
+
+message GraphResult {
+  google.rpc.Status status = 1;
+  uint64 completed_nodes = 2;
+  repeated RootResult roots = 3;
+  // Set when status is non-OK because an action executed but failed. This is
+  // empty for successful graphs and graph-level finalization failures.
+  string failed_node_id = 4;
+}
+
+message RootResult {
+  RootOutput root = 1;
+  build.bazel.remote.execution.v2.Digest digest = 2;
+  bool is_executable = 3;
+}
+
+message GraphStreamError {
+  google.rpc.Status status = 1;
+  bool terminal = 2;
+}

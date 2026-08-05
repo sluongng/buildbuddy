@@ -72,7 +72,9 @@ type schedulerServerMock struct {
 	interfaces.SchedulerService
 
 	canceledCount int
+	cancelReqCh   chan string
 	scheduleReqs  []*scpb.ScheduleTaskRequest
+	scheduleReqCh chan *scpb.ScheduleTaskRequest
 	scheduleErr   error
 }
 
@@ -98,14 +100,37 @@ func (s *schedulerServerMock) GetSharedExecutorPoolGroupID() string {
 
 func (s *schedulerServerMock) ScheduleTask(ctx context.Context, req *scpb.ScheduleTaskRequest) (*scpb.ScheduleTaskResponse, error) {
 	s.scheduleReqs = append(s.scheduleReqs, req)
+	if s.scheduleReqCh != nil {
+		s.scheduleReqCh <- req
+	}
 	if s.scheduleErr != nil {
 		return nil, s.scheduleErr
 	}
 	return &scpb.ScheduleTaskResponse{}, nil
 }
 
+func (s *schedulerServerMock) EnsureTask(ctx context.Context, req *scpb.EnsureTaskRequest) (*scpb.EnsureTaskResponse, error) {
+	for _, existing := range s.scheduleReqs {
+		if existing.GetTaskId() == req.GetTaskId() {
+			return &scpb.EnsureTaskResponse{Created: false}, nil
+		}
+	}
+	_, err := s.ScheduleTask(ctx, &scpb.ScheduleTaskRequest{
+		TaskId:         req.GetTaskId(),
+		Metadata:       req.GetMetadata(),
+		SerializedTask: req.GetSerializedTask(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &scpb.EnsureTaskResponse{Created: true}, nil
+}
+
 func (s *schedulerServerMock) CancelTask(ctx context.Context, taskID string) (bool, error) {
 	s.canceledCount++
+	if s.cancelReqCh != nil {
+		s.cancelReqCh <- taskID
+	}
 	return true, nil
 }
 
@@ -113,7 +138,10 @@ func setupEnvWithClock(t *testing.T, clock clockwork.Clock) (*testenv.TestEnv, *
 	env := testenv.GetTestEnv(t)
 	env.SetClock(clock)
 
-	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers(
+		"US1", "GR1",
+		"US2", "GR2",
+	)))
 
 	r := testredis.Start(t)
 	rdb := redis.NewClient(redisutil.TargetToOptions(r.Target))
@@ -123,7 +151,10 @@ func setupEnvWithClock(t *testing.T, clock clockwork.Clock) (*testenv.TestEnv, *
 	env.SetRemoteExecutionRedisClient(rdb)
 	env.SetRemoteExecutionRedisPubSubClient(rdb)
 
-	scheduler := &schedulerServerMock{}
+	scheduler := &schedulerServerMock{
+		scheduleReqCh: make(chan *scpb.ScheduleTaskRequest, 100),
+		cancelReqCh:   make(chan string, 100),
+	}
 	env.SetSchedulerService(scheduler)
 
 	tasksize.Register(env)
@@ -137,6 +168,7 @@ func setupEnvWithClock(t *testing.T, clock clockwork.Clock) (*testenv.TestEnv, *
 	env.SetUsageTracker(testusage.NewTracker())
 
 	repb.RegisterExecutionServer(env.GetGRPCServer(), env.GetRemoteExecutionService())
+	registerGraphExecutionServer(env.GetGRPCServer(), s)
 	go run()
 
 	conn, err := testenv.LocalGRPCConn(env.GetServerContext(), lis)

@@ -2,6 +2,8 @@ package scheduler_server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -110,6 +112,11 @@ const (
 	// Maximum task TTL in Redis.
 	taskTTL = 24 * time.Hour
 
+	// Completed task payloads are retained long enough to cover the durable
+	// graph coordinator's active recovery lifetime (currently 30 minutes), but
+	// are still bounded.
+	taskCompletionTTL = 1 * time.Hour
+
 	// Names of task fields in Redis task hash.
 	redisTaskProtoField              = "taskProto"
 	redisTaskMetadataField           = "schedulingMetadataProto"
@@ -117,6 +124,9 @@ const (
 	redisTaskAttempCountField        = "attemptCount"
 	redisTaskClaimedField            = "claimed"
 	redisTaskReconnectPeriodEndField = "reconnectPeriodEnd"
+	redisTaskCompletedField          = "completed"
+	redisTaskFingerprintField        = "immutableFingerprint"
+	redisTaskDurableEnsureField      = "durableEnsureTask"
 
 	// Maximum number of unclaimed task IDs we track per pool.
 	maxUnclaimedTasksTracked = 10_000
@@ -164,6 +174,11 @@ var (
 	redisAcquireClaim = redis.NewScript(`
 		-- Task not found
 		if redis.call("exists", KEYS[1]) == 0 then
+			return 10
+		end
+
+		-- Completed task tombstones cannot be claimed.
+		if redis.call("hget", KEYS[1], "completed") == "1" then
 			return 10
 		end
 	
@@ -242,13 +257,117 @@ var (
 		else 
 			return 0 
 		end`)
-	// Task deleted if claim field is present.
+	// Atomically finalizes a claimed task. Only tasks explicitly marked by
+	// EnsureTask retain a bounded completion tombstone; ordinary and legacy
+	// tasks keep the original immediate-delete behavior. The compact tombstone
+	// retains only the immutable fingerprint and completion marker.
 	redisDeleteClaimedTask = redis.NewScript(`
-		if redis.call("hget", KEYS[1], "claimed") == "1" then 
-			return redis.call("del", KEYS[1]) 
-		else 
-			return 0 
-		end`)
+		if redis.call("hget", KEYS[1], "claimed") ~= "1" then
+			return 0
+		end
+		if redis.call("hget", KEYS[1], "durableEnsureTask") ~= "1"
+			or redis.call("hexists", KEYS[1], "immutableFingerprint") == 0 then
+			return redis.call("del", KEYS[1])
+		end
+		redis.call("hdel", KEYS[1],
+			"taskProto", "schedulingMetadataProto", "durableEnsureTask",
+			"claimed", "leaseId", "reconnectToken", "reconnectPeriodEnd",
+			"queuedAtUsec", "attemptCount")
+		redis.call("hset", KEYS[1], "completed", "1")
+		redis.call("expire", KEYS[1], ARGV[1])
+		return 1
+	`)
+	// Deletes an active task, but never deletes a completion tombstone.
+	redisDeleteUncompletedTask = redis.NewScript(`
+		if redis.call("hget", KEYS[1], "completed") == "1" then
+			return 0
+		end
+		return redis.call("del", KEYS[1])
+	`)
+	// Reports whether a task exists and is not a completion tombstone.
+	redisTaskExists = redis.NewScript(`
+		if redis.call("exists", KEYS[1]) == 0 then
+			return 0
+		end
+		if redis.call("hget", KEYS[1], "completed") == "1" then
+			return 0
+		end
+		return 1
+	`)
+	// Atomically inserts a new task for legacy ScheduleTask semantics. These
+	// tasks are intentionally not fingerprinted or marked as durable.
+	redisInsertTask = redis.NewScript(`
+		if redis.call("exists", KEYS[1]) ~= 0 then
+			return 0
+		end
+		redis.call(
+			"hset", KEYS[1],
+			"taskProto", ARGV[1],
+			"schedulingMetadataProto", ARGV[2],
+			"queuedAtUsec", ARGV[3],
+			"attemptCount", 0
+		)
+		redis.call("expire", KEYS[1], ARGV[4])
+		return 1
+	`)
+	// Atomically creates an immutable task record, or verifies that an existing
+	// task has the exact same immutable payload. Existing task fields and TTL
+	// are intentionally left untouched.
+	//
+	// Return values:
+	//  - 1 task created
+	//  - 0 identical task already exists
+	//  - 2 identical task already completed
+	//  - 3 identical task already claimed
+	//  - -1 task ID exists with a different payload
+	redisEnsureTask = redis.NewScript(`
+		if redis.call("exists", KEYS[1]) == 0 then
+			redis.call(
+				"hset", KEYS[1],
+				"taskProto", ARGV[1],
+				"schedulingMetadataProto", ARGV[2],
+				"immutableFingerprint", ARGV[3],
+				"durableEnsureTask", "1",
+				"queuedAtUsec", ARGV[4],
+				"attemptCount", 0
+			)
+			redis.call("expire", KEYS[1], ARGV[5])
+			return 1
+		end
+
+		local fingerprint = redis.call("hget", KEYS[1], "immutableFingerprint")
+		if fingerprint == ARGV[3] then
+			if redis.call("hget", KEYS[1], "completed") == "1" then
+				return 2
+			end
+			redis.call("hset", KEYS[1], "durableEnsureTask", "1")
+			if redis.call("hget", KEYS[1], "claimed") == "1" then
+				return 3
+			end
+			return 0
+		end
+
+		-- Compatibility with tasks created before immutable fingerprints were
+		-- stored. Backfill the derived fingerprint after exact comparison.
+		if not fingerprint
+			and redis.call("hget", KEYS[1], "taskProto") == ARGV[1]
+			and redis.call("hget", KEYS[1], "schedulingMetadataProto") == ARGV[2] then
+			redis.call(
+				"hset", KEYS[1],
+				"immutableFingerprint", ARGV[3],
+				"durableEnsureTask", "1"
+			)
+			if redis.call("hget", KEYS[1], "completed") == "1" then
+				redis.call("hdel", KEYS[1], "taskProto", "schedulingMetadataProto")
+				return 2
+			end
+			if redis.call("hget", KEYS[1], "claimed") == "1" then
+				return 3
+			end
+			return 0
+		end
+		return -1
+	`)
 )
 
 func init() {
@@ -1688,48 +1807,114 @@ func (s *SchedulerServer) insertTask(ctx context.Context, taskID string, metadat
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
-	serializedMetadata, err := proto.Marshal(metadata)
+	serializedMetadata, err := (proto.MarshalOptions{Deterministic: true}).Marshal(metadata)
 	if err != nil {
 		return status.InternalErrorf("unable to serialize scheduling metadata: %v", err)
 	}
 
-	props := map[string]interface{}{
-		redisTaskProtoField:       serializedTask,
-		redisTaskMetadataField:    serializedMetadata,
-		redisTaskQueuedAtUsec:     time.Now().UnixMicro(),
-		redisTaskAttempCountField: 0,
-	}
-	c, err := s.rdb.HSet(ctx, s.redisKeyForTask(taskID), props).Result()
+	c, err := redisInsertTask.Run(
+		ctx,
+		s.rdb,
+		[]string{s.redisKeyForTask(taskID)},
+		serializedTask,
+		serializedMetadata,
+		time.Now().UnixMicro(),
+		int64(taskTTL/time.Second),
+	).Int()
 	if err != nil {
 		return err
 	}
 	if c == 0 {
 		return status.AlreadyExistsErrorf("task %s already exists", taskID)
 	}
-	ok, err := s.rdb.Expire(ctx, s.redisKeyForTask(taskID), taskTTL).Result()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return status.DataLossErrorf("task %s disappeared before we could set TTL", taskID)
+	if c != 1 {
+		return status.InternalErrorf("unexpected insert task result %d for task %s", c, taskID)
 	}
 	return nil
 }
 
+type ensureTaskState int
+
+const (
+	ensureTaskCreated ensureTaskState = iota
+	ensureTaskExisting
+	ensureTaskCompleted
+	ensureTaskClaimed
+)
+
+func immutableTaskFingerprint(serializedTask, serializedMetadata []byte) []byte {
+	h := sha256.New()
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(serializedTask)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write(serializedTask)
+	binary.BigEndian.PutUint64(size[:], uint64(len(serializedMetadata)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write(serializedMetadata)
+	return h.Sum(nil)
+}
+
+// ensureTask atomically creates a task if absent or verifies that the existing
+// immutable task payload has the same deterministic fingerprint. It never
+// modifies mutable lease fields, attempt counters, queue time, or TTL.
+func (s *SchedulerServer) ensureTask(ctx context.Context, taskID string, metadata *scpb.SchedulingMetadata, serializedTask []byte) (ensureTaskState, error) {
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+
+	serializedMetadata, err := (proto.MarshalOptions{Deterministic: true}).Marshal(metadata)
+	if err != nil {
+		return 0, status.InternalErrorf("unable to serialize scheduling metadata: %v", err)
+	}
+
+	r, err := redisEnsureTask.Run(
+		ctx,
+		s.rdb,
+		[]string{s.redisKeyForTask(taskID)},
+		serializedTask,
+		serializedMetadata,
+		immutableTaskFingerprint(serializedTask, serializedMetadata),
+		time.Now().UnixMicro(),
+		int64(taskTTL/time.Second),
+	).Int()
+	if err != nil {
+		return 0, err
+	}
+	switch r {
+	case 1:
+		return ensureTaskCreated, nil
+	case 0:
+		return ensureTaskExisting, nil
+	case 2:
+		return ensureTaskCompleted, nil
+	case 3:
+		return ensureTaskClaimed, nil
+	case -1:
+		return 0, status.AlreadyExistsErrorf("task %s already exists with a different payload", taskID)
+	default:
+		return 0, status.InternalErrorf("unexpected ensure task result %d for task %s", r, taskID)
+	}
+}
+
 func (s *SchedulerServer) deleteTask(ctx context.Context, taskID string) (bool, error) {
 	key := s.redisKeyForTask(taskID)
-	n, err := s.rdb.Del(ctx, key).Result()
+	n, err := redisDeleteUncompletedTask.Run(ctx, s.rdb, []string{key}).Int()
 	return n == 1, err
 }
 
 func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) error {
-	// The script will return 1 if the task is claimed & has been deleted.
-	r, err := redisDeleteClaimedTask.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)}).Result()
+	// The script will return 1 if the claimed task was atomically replaced by a
+	// completion tombstone.
+	r, err := redisDeleteClaimedTask.Run(
+		ctx,
+		s.rdb,
+		[]string{s.redisKeyForTask(taskID)},
+		int64(taskCompletionTTL/time.Second),
+	).Result()
 	if err != nil {
 		return err
 	}
 	if c, ok := r.(int64); !ok || c != 1 {
-		return status.NotFoundErrorf("unable to delete claimed task %s", taskID)
+		return status.NotFoundErrorf("unable to finalize claimed task %s", taskID)
 	}
 
 	action_merger.DeletePendingExecution(ctx, s.rdb, taskID)
@@ -1936,6 +2121,7 @@ func (s *SchedulerServer) readTask(ctx context.Context, taskID string) (*persist
 		redisTaskQueuedAtUsec,
 		redisTaskAttempCountField,
 		redisTaskReconnectPeriodEndField,
+		redisTaskCompletedField,
 	}
 	key := s.redisKeyForTask(taskID)
 	vals, err := s.rdb.HMGet(ctx, key, fields...).Result()
@@ -1944,6 +2130,9 @@ func (s *SchedulerServer) readTask(ctx context.Context, taskID string) (*persist
 	}
 	if len(vals) != len(fields) {
 		return nil, status.FailedPreconditionErrorf("unexpected # of returned values in redis response: %+v", vals)
+	}
+	if completed, ok := vals[5].(string); ok && completed == "1" {
+		return nil, status.NotFoundErrorf("task %q completed", taskID)
 	}
 	if vals[0] == nil {
 		return nil, status.NotFoundErrorf("task %q not found", taskID)
@@ -2173,15 +2362,16 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 		done := req.GetFinalize() || req.GetRelease() || req.GetReEnqueue()
 
 		if req.GetFinalize() && claimed {
-			// Finalize deletes the task (and implicitly releases the lease).
-			// It implies that no further work will/can be attempted for this task.
+			// Finalize replaces the task with a bounded completion tombstone
+			// (and implicitly releases the lease). It implies that no further
+			// work will/can be attempted for this task.
 
 			err := s.deleteClaimedTask(ctx, taskID)
 			if err == nil {
 				claimed = false
 				log.CtxInfof(ctx, "LeaseTask task %q successfully finalized by %q", taskID, executorID)
 			} else {
-				log.CtxWarningf(ctx, "Could not delete claimed task %q: %s", taskID, err)
+				log.CtxWarningf(ctx, "Could not finalize claimed task %q: %s", taskID, err)
 			}
 		} else if (req.GetRelease() || req.GetReEnqueue()) && claimed {
 			// Release removes the claim on the task without deleting the task.
@@ -2603,13 +2793,70 @@ func (s *SchedulerServer) ScheduleTask(ctx context.Context, req *scpb.ScheduleTa
 	return &scpb.ScheduleTaskResponse{}, nil
 }
 
+// EnsureTask idempotently persists and explicitly marks a durable task, then
+// (re)issues its reservations. If an identical completion tombstone exists, it
+// reports completion without issuing a reservation. Ordinary ScheduleTask
+// records are never marked durable and retain immediate-delete finalization.
+// An already-claimed durable task also receives no duplicate reservation.
+//
+// Reissuing reservations is safe: executors atomically acquire the claim stored
+// in the task hash, so at most one executor can run the task at a time. Unlike
+// ScheduleTask, an enqueue failure does not delete the task; a caller retry can
+// safely reissue the reservation.
+func (s *SchedulerServer) EnsureTask(ctx context.Context, req *scpb.EnsureTaskRequest) (*scpb.EnsureTaskResponse, error) {
+	if req.GetTaskId() == "" {
+		return nil, status.FailedPreconditionError("A task_id is required")
+	}
+	if req.Metadata == nil {
+		return nil, status.FailedPreconditionError("Scheduling metadata is required")
+	}
+	if req.Metadata.TaskSize == nil {
+		return nil, status.FailedPreconditionError("A task_size is required")
+	}
+	if len(req.GetSerializedTask()) == 0 {
+		return nil, status.FailedPreconditionError("Serialized task is required")
+	}
+
+	task := &repb.ExecutionTask{}
+	if err := proto.Unmarshal(req.GetSerializedTask(), task); err != nil {
+		return nil, status.InternalErrorf("failed to unmarshal ExecutionTask: %s", err)
+	}
+	taskState, err := s.ensureTask(ctx, req.GetTaskId(), req.GetMetadata(), req.GetSerializedTask())
+	if err != nil {
+		return nil, err
+	}
+	if taskState == ensureTaskCompleted {
+		return &scpb.EnsureTaskResponse{Completed: true}, nil
+	}
+	if taskState == ensureTaskClaimed {
+		return &scpb.EnsureTaskResponse{}, nil
+	}
+	metadata := req.GetMetadata()
+	enqueueRequest := &scpb.EnqueueTaskReservationRequest{
+		TaskId:             req.GetTaskId(),
+		TaskSize:           metadata.GetTaskSize(),
+		SchedulingMetadata: metadata,
+	}
+	opts := enqueueTaskReservationOpts{
+		numReplicas:                  probesPerTask,
+		scheduleOnConnectedExecutors: false,
+	}
+	if ci_runner_util.IsRemoteRunnerTask(task) && taskState == ensureTaskCreated {
+		emitRemoteRunnerMetric(ctx, task, metadata, "initial")
+	}
+	if err := s.enqueueTaskReservations(ctx, enqueueRequest, task, opts); err != nil {
+		return nil, err
+	}
+	return &scpb.EnsureTaskResponse{Created: taskState == ensureTaskCreated}, nil
+}
+
 func (s *SchedulerServer) CancelTask(ctx context.Context, taskID string) (bool, error) {
 	return s.deleteTask(ctx, taskID)
 }
 
 func (s *SchedulerServer) ExistsTask(ctx context.Context, taskID string) (bool, error) {
 	key := s.redisKeyForTask(taskID)
-	n, err := s.rdb.Exists(ctx, key).Result()
+	n, err := redisTaskExists.Run(ctx, s.rdb, []string{key}).Int()
 	return n == 1, err
 }
 

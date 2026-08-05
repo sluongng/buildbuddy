@@ -1404,6 +1404,118 @@ var (
 		Arch,
 	})
 
+	GraphExecutionRequestMessagesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "request_messages_count",
+		Help:      "Number of GraphExecute request messages received, including resume and idempotent replay messages.",
+	})
+
+	GraphExecutionResponseMessagesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "response_messages_count",
+		Help:      "Number of GraphExecute response messages successfully sent, including replayed responses.",
+	})
+
+	GraphExecutionRequestBytesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "request_bytes_count",
+		Help:      "Serialized bytes in GraphExecute request messages received, including resume and idempotent replay messages.",
+	})
+
+	GraphExecutionResponseBytesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "response_bytes_count",
+		Help:      "Serialized bytes in GraphExecute response messages successfully sent, including replayed responses.",
+	})
+
+	GraphExecutionDurablePreparedTaskBytesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_prepared_task_bytes_count",
+		Help:      "Serialized scheduler task bytes newly persisted for durable graph execution recovery.",
+	})
+
+	GraphExecutionDurableRequestBytesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_request_bytes_count",
+		Help:      "GraphExecute request bytes newly appended to the durable Redis journal.",
+	})
+
+	GraphExecutionDurableResponseBytesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_response_bytes_count",
+		Help:      "GraphExecute response bytes newly appended to the durable Redis journal.",
+	})
+
+	GraphExecutionDurableRecoveriesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_recoveries_count",
+		Help:      "Number of graph sessions reconstructed from durable Redis state.",
+	})
+
+	GraphExecutionDurableFencedMutationsCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_fenced_mutations_count",
+		Help:      "Number of graph mutations rejected because the coordinator lease was no longer owned.",
+	})
+
+	GraphExecutionDurableAdmissionRejectionsCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "durable_admission_rejections_count",
+		Help:      "Number of graph sessions rejected by distributed durable-session bounds.",
+	})
+
+	GraphExecutionReadyNodesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "ready_nodes_count",
+		Help:      "Number of graph nodes whose scheduling dependencies and inputs became ready.",
+	})
+
+	GraphExecutionBeginToFirstReadyUsecCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "benchmark_begin_to_first_ready_usec_count",
+		Help:      "Benchmark-only accumulated microseconds from BeginGraph to the first ready node, observed once per applicable session.",
+	})
+
+	GraphExecutionBeginToTerminalCompletionUsecCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "benchmark_begin_to_terminal_completion_usec_count",
+		Help:      "Benchmark-only accumulated microseconds from BeginGraph to terminal graph completion, observed once per session.",
+	})
+
+	GraphExecutionCacheHitNodesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "cache_hit_nodes_count",
+		Help:      "Number of graph nodes completed from the standard REAPI action cache.",
+	})
+
+	GraphExecutionExecutedNodesCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "executed_nodes_count",
+		Help:      "Number of graph nodes completed without a standard REAPI action cache hit.",
+	})
+
+	GraphExecutionAvoidedClientExecuteRPCsCount = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "graph_execution",
+		Name:      "avoided_client_execute_rpcs_count",
+		Help:      "Number of per-action REAPI Execute RPCs avoided by scheduling nodes through a GraphExecute stream.",
+	})
+
 	RemoteExecutionExecutorRegistrationCount = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: bbNamespace,
 		Subsystem: "remote_execution",

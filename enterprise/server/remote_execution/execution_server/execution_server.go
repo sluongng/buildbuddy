@@ -86,7 +86,11 @@ const (
 	// When an action finishes, schedule the corresponding pubsub channel to
 	// be discarded after this time. There may be multiple waiters for a single
 	// action so we cannot discard the channel immediately.
-	completedPubSubChanExpiration = 15 * time.Minute
+	// This is global rather than graph-specific because multiple ordinary and
+	// graph waiters may race to apply the terminal stream TTL; allowing an
+	// ordinary waiter to shorten it would violate the 30-minute durable graph
+	// recovery window. Five minutes of tolerance covers takeover and reconnect.
+	completedPubSubChanExpiration = 35 * time.Minute
 )
 
 var (
@@ -191,6 +195,19 @@ type ExecutionServer struct {
 
 	mu          sync.Mutex
 	teeLimiters map[string]*rate.Limiter
+
+	graphSessionsMu        sync.Mutex
+	graphSessions          map[string]*graphExecution
+	graphRetentionSequence uint64
+	graphServerID          string
+	graphShuttingDown      bool
+	graphShutdownReleases  bool
+	graphHandlers          sync.WaitGroup
+
+	graphRecoveredWaiterHookMu          sync.Mutex
+	graphRecoveredWaiterHook            func(executionID string)
+	graphMissingBlobFinderForTesting    graphMissingBlobFinder
+	beforeGraphSessionPublishForTesting func(*graphExecution)
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -783,6 +800,8 @@ func (s *ExecutionServer) dispatchHedge(ctx context.Context, req *repb.ExecuteRe
 type dispatchOpts struct {
 	recordActionMergingState bool
 	teedRequest              bool
+	ensureTask               bool
+	persistEnsureTask        func(*scpb.EnsureTaskRequest) error
 }
 
 func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest, action *repb.Action, executionID string, opts *dispatchOpts) (*interfaces.PoolInfo, error) {
@@ -852,7 +871,10 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 	}
 
 	if err := s.insertExecution(ctx, executionID, invocationID, command, repb.ExecutionStage_UNKNOWN, props.Pool); err != nil {
-		return nil, status.UnavailableErrorf("create execution: %s", err)
+		if !opts.ensureTask || !s.dbHandle.IsDuplicateKeyError(err) {
+			return nil, status.UnavailableErrorf("create execution: %s", err)
+		}
+		log.CtxInfof(ctx, "Reusing durable graph execution record %q", executionID)
 	}
 
 	// Don't associate teed requests with the original invocation.
@@ -1062,12 +1084,27 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 		// Should never happen.
 		return nil, status.InternalErrorf("marshal execution task %q: %s", executionID, err)
 	}
-	scheduleReq := &scpb.ScheduleTaskRequest{
-		TaskId:         executionID,
-		Metadata:       schedulingMetadata,
-		SerializedTask: serializedTask,
+	var scheduleErr error
+	if opts.ensureTask {
+		ensureRequest := &scpb.EnsureTaskRequest{
+			TaskId:         executionID,
+			Metadata:       schedulingMetadata,
+			SerializedTask: serializedTask,
+		}
+		if opts.persistEnsureTask != nil {
+			if err := opts.persistEnsureTask(ensureRequest); err != nil {
+				return nil, err
+			}
+		}
+		_, scheduleErr = scheduler.EnsureTask(ctx, ensureRequest)
+	} else {
+		_, scheduleErr = scheduler.ScheduleTask(ctx, &scpb.ScheduleTaskRequest{
+			TaskId:         executionID,
+			Metadata:       schedulingMetadata,
+			SerializedTask: serializedTask,
+		})
 	}
-	if _, err := scheduler.ScheduleTask(ctx, scheduleReq); err != nil {
+	if scheduleErr != nil {
 		ctx, cancel := background.ExtendContextForFinalization(ctx, deletePendingExecutionExtraTimeout)
 		defer cancel()
 		if opts.recordActionMergingState {
@@ -1078,7 +1115,7 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 				log.CtxWarningf(ctx, "Failed to delete pubsub channel: %s", err)
 			}
 		}
-		return nil, status.UnavailableErrorf("Error scheduling execution task %q: %s", executionID, err)
+		return nil, status.UnavailableErrorf("Error scheduling execution task %q: %s", executionID, scheduleErr)
 	}
 
 	return pool, nil
@@ -1175,6 +1212,135 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 	return s.waitExecution(ctx, &waitReq, stream, waitOpts{isExecuteRequest: true})
 }
 
+// executeGraphNode executes or reattaches to a graph node using a stable,
+// durably journaled execution ID. The scheduler's EnsureTask operation makes
+// dispatch idempotent across coordinator failover, including do_not_cache
+// actions that intentionally bypass ordinary action merging.
+func (s *ExecutionServer) executeGraphNode(
+	req *repb.ExecuteRequest,
+	executionID string,
+	preparedTask *scpb.EnsureTaskRequest,
+	persistPreparedTask func(*scpb.EnsureTaskRequest) error,
+	stream streamLike,
+) error {
+	if req.GetExecutionPolicy().GetPriority() > capabilities_server.MaxExecutionPriority || req.GetExecutionPolicy().GetPriority() < capabilities_server.MinExecutionPriority {
+		return status.InvalidArgumentErrorf("invalid execution priority %d; priority values must be between %d and %d (inclusive)", req.GetExecutionPolicy().GetPriority(), capabilities_server.MinExecutionPriority, capabilities_server.MaxExecutionPriority)
+	}
+	ctx, err := prefix.AttachUserPrefixToContext(stream.Context(), s.authenticator)
+	if err != nil {
+		return err
+	}
+	adInstanceDigest := digest.NewCASResourceName(req.GetActionDigest(), req.GetInstanceName(), req.GetDigestFunction())
+	if !req.GetSkipCacheLookup() {
+		if actionResult, err := s.getActionResultFromCache(ctx, adInstanceDigest); err == nil {
+			stateChangeFn := operation.GetStateChangeFunc(stream, executionID, adInstanceDigest.GetDigest())
+			return stateChangeFn(repb.ExecutionStage_COMPLETED, operation.ExecuteResponseWithCachedResult(actionResult))
+		}
+	}
+	action, err := s.fetchAction(ctx, adInstanceDigest)
+	if err != nil {
+		return err
+	}
+	if op, err := s.lastExecutionOperation(ctx, executionID); err != nil {
+		return err
+	} else if op != nil && operation.ExtractStage(op) == repb.ExecutionStage_COMPLETED {
+		return stream.Send(op)
+	}
+	if preparedTask != nil {
+		ensureResponse, err := s.env.GetSchedulerService().EnsureTask(ctx, preparedTask)
+		if err != nil {
+			return status.UnavailableErrorf("ensure durable graph execution %q: %s", executionID, err)
+		}
+		if ensureResponse.GetCompleted() {
+			// EnsureTask tombstones are retained longer than the 30-minute
+			// durable graph lifetime. A completed tombstone means dispatch must
+			// never be recreated; recover the terminal operation from execution
+			// storage instead of blindly waiting on a stream that cannot emit.
+			op, err := s.lastExecutionOperation(ctx, executionID)
+			if err != nil {
+				return err
+			}
+			if op == nil || operation.ExtractStage(op) != repb.ExecutionStage_COMPLETED {
+				return status.DataLossErrorf(
+					"scheduler reports durable graph execution %q completed, but its terminal operation is unavailable",
+					executionID)
+			}
+			return stream.Send(op)
+		}
+	} else {
+		if qm := s.env.GetQuotaManager(); qm != nil {
+			namespace := quota.GetSKUKey(sku.RemoteExecutionExecuteWorkerCPUNanos)
+			if err := qm.Allow(ctx, namespace, 1); err != nil {
+				return err
+			}
+		}
+		if _, err := s.dispatch(ctx, req, action, executionID, &dispatchOpts{
+			ensureTask:        true,
+			persistEnsureTask: persistPreparedTask,
+		}); err != nil {
+			return err
+		}
+	}
+	waitOptions := waitOpts{isExecuteRequest: false}
+	if preparedTask != nil {
+		waitOptions.onSubscribed = func() {
+			s.notifyGraphRecoveredWaiterSubscribed(executionID)
+		}
+	}
+	return s.waitExecution(
+		ctx,
+		&repb.WaitExecutionRequest{Name: executionID},
+		stream,
+		waitOptions,
+	)
+}
+
+// SetGraphRecoveredWaiterSubscribedHookForTesting installs an app-local hook
+// that fires after a recovered graph node has created its SubscribeTail
+// subscription. It lets the multi-app fault harness establish the exact
+// reattachment barrier before releasing an executor. Production callers should
+// leave this unset.
+func (s *ExecutionServer) SetGraphRecoveredWaiterSubscribedHookForTesting(hook func(executionID string)) {
+	s.graphRecoveredWaiterHookMu.Lock()
+	s.graphRecoveredWaiterHook = hook
+	s.graphRecoveredWaiterHookMu.Unlock()
+}
+
+func (s *ExecutionServer) notifyGraphRecoveredWaiterSubscribed(executionID string) {
+	s.graphRecoveredWaiterHookMu.Lock()
+	hook := s.graphRecoveredWaiterHook
+	s.graphRecoveredWaiterHookMu.Unlock()
+	if hook != nil {
+		hook(executionID)
+	}
+}
+
+func (s *ExecutionServer) lastExecutionOperation(ctx context.Context, executionID string) (*longrunningpb.Operation, error) {
+	messages, err := s.rdb.XRevRangeN(
+		ctx,
+		s.pubSubChannelForExecutionID(executionID).String(),
+		"+",
+		"-",
+		1,
+	).Result()
+	if err == redis.Nil || len(messages) == 0 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, status.UnavailableErrorf("read durable execution status %q: %s", executionID, err)
+	}
+	encoded, ok := messages[0].Values["data"].(string)
+	if !ok {
+		return nil, nil
+	}
+	op, err := operation.Decode(encoded)
+	if err != nil {
+		// A monitored channel begins with a non-operation marker.
+		return nil, nil
+	}
+	return op, nil
+}
+
 // WaitExecution waits for an execution operation to complete. When the client initially
 // makes the request, the server immediately responds with the current status
 // of the execution. The server will leave the request stream open until the
@@ -1231,6 +1397,8 @@ func (e *InProgressExecution) processOpUpdate(ctx context.Context, op *longrunni
 type waitOpts struct {
 	// Indicates whether the wait is being called from Execute or WaitExecution RPC.
 	isExecuteRequest bool
+	// Called synchronously after the status-stream subscription is established.
+	onSubscribed func()
 }
 
 func (s *ExecutionServer) getGroupIDForMetrics(ctx context.Context) string {
@@ -1270,6 +1438,9 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 		subscriber = s.streamPubSub.SubscribeTail(ctx, subChan)
 	}
 	defer subscriber.Close()
+	if opts.onSubscribed != nil {
+		opts.onSubscribed()
+	}
 	streamPubSubChan := subscriber.Chan()
 
 	if opts.isExecuteRequest {

@@ -2,6 +2,7 @@ package scheduler_server
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"slices"
@@ -761,6 +762,14 @@ func newScheduleRequest(ctx context.Context, t *testing.T, env environment.Env, 
 	}
 }
 
+func newEnsureTaskRequest(req *scpb.ScheduleTaskRequest) *scpb.EnsureTaskRequest {
+	return &scpb.EnsureTaskRequest{
+		TaskId:         req.GetTaskId(),
+		Metadata:       proto.Clone(req.GetMetadata()).(*scpb.SchedulingMetadata),
+		SerializedTask: slices.Clone(req.GetSerializedTask()),
+	}
+}
+
 func scheduleTask(ctx context.Context, t *testing.T, env environment.Env, props map[string]string) string {
 	req := newScheduleRequest(ctx, t, env, scheduleOpts{props: props})
 	_, err := env.GetSchedulerService().ScheduleTask(ctx, req)
@@ -1157,6 +1166,360 @@ func TestScheduleTask_DeletesTaskOnEnqueueFailure(t *testing.T) {
 	resp, err := env.GetSchedulerClient().TaskExists(ctx, &scpb.TaskExistsRequest{TaskId: req.GetTaskId()})
 	require.NoError(t, err)
 	require.False(t, resp.GetExists())
+}
+
+func TestFinalizeTask_NonDurableTasksDeleteImmediately(t *testing.T) {
+	for _, testCase := range []struct {
+		name                string
+		addTransitionalHash bool
+		forceLegacyShape    bool
+	}{
+		{name: "ordinary_schedule_task"},
+		{name: "legacy_without_fingerprint", forceLegacyShape: true},
+		// Simulate a task created by the previous intermediate implementation,
+		// which fingerprinted every task but did not have an explicit durable
+		// marker. A fingerprint alone must never opt a task into retention.
+		{name: "rolling_upgrade_fingerprint_without_marker", addTransitionalHash: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			s := env.GetSchedulerService().(*SchedulerServer)
+			fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+			fe.Register()
+
+			req := newScheduleRequest(ctx, t, env, scheduleOpts{})
+			_, err := s.ScheduleTask(ctx, req)
+			require.NoError(t, err)
+			fe.WaitForTask(req.GetTaskId())
+
+			key := s.redisKeyForTask(req.GetTaskId())
+			if testCase.forceLegacyShape {
+				require.NoError(t, s.rdb.HDel(
+					ctx,
+					key,
+					redisTaskFingerprintField,
+					redisTaskDurableEnsureField,
+				).Err())
+			}
+			if testCase.addTransitionalHash {
+				metadata, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetMetadata())
+				require.NoError(t, err)
+				require.NoError(t, s.rdb.HSet(
+					ctx,
+					key,
+					redisTaskFingerprintField,
+					immutableTaskFingerprint(req.GetSerializedTask(), metadata),
+				).Err())
+			}
+			require.Empty(t, s.rdb.HGet(ctx, key, redisTaskDurableEnsureField).Val())
+
+			lease := fe.Claim(req.GetTaskId())
+			require.NoError(t, lease.Finalize())
+
+			exists, err := s.rdb.Exists(ctx, key).Result()
+			require.NoError(t, err)
+			require.Zero(t, exists)
+		})
+	}
+}
+
+func TestEnsureTask_AdoptsIdenticalActiveTaskAsDurable(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	scheduleReq := newScheduleRequest(ctx, t, env, scheduleOpts{})
+	_, err := s.ScheduleTask(ctx, scheduleReq)
+	require.NoError(t, err)
+	fe.WaitForTask(scheduleReq.GetTaskId())
+
+	key := s.redisKeyForTask(scheduleReq.GetTaskId())
+	require.Empty(t, s.rdb.HGet(ctx, key, redisTaskFingerprintField).Val())
+	require.Empty(t, s.rdb.HGet(ctx, key, redisTaskDurableEnsureField).Val())
+
+	resp, err := s.EnsureTask(ctx, newEnsureTaskRequest(scheduleReq))
+	require.NoError(t, err)
+	require.False(t, resp.GetCreated())
+	require.False(t, resp.GetCompleted())
+	require.Equal(t, "1", s.rdb.HGet(ctx, key, redisTaskDurableEnsureField).Val())
+	require.Len(t, s.rdb.HGet(ctx, key, redisTaskFingerprintField).Val(), sha256.Size)
+
+	lease := fe.Claim(scheduleReq.GetTaskId())
+	require.NoError(t, lease.Finalize())
+	fields, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1", fields[redisTaskCompletedField])
+	require.Len(t, fields[redisTaskFingerprintField], sha256.Size)
+	require.Len(t, fields, 2)
+}
+
+func TestEnsureTask_IdenticalUnclaimedTaskReissuesWithoutMutation(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	req := newEnsureTaskRequest(newScheduleRequest(ctx, t, env, scheduleOpts{}))
+	resp, err := s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.True(t, resp.GetCreated())
+	fe.WaitForTask(req.GetTaskId())
+	fe.ResetTasks()
+
+	key := s.redisKeyForTask(req.GetTaskId())
+	require.NoError(t, s.rdb.Expire(ctx, key, time.Hour).Err())
+	before, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+
+	resp, err = s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.False(t, resp.GetCreated())
+	require.False(t, resp.GetCompleted())
+	fe.WaitForTask(req.GetTaskId())
+
+	after, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	ttl, err := s.rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+	require.LessOrEqual(t, ttl, time.Hour)
+}
+
+func TestEnsureTask_IdenticalClaimedTaskDoesNotReissueReservation(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	req := newEnsureTaskRequest(newScheduleRequest(ctx, t, env, scheduleOpts{}))
+	resp, err := s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.True(t, resp.GetCreated())
+	require.Equal(
+		t,
+		"1",
+		s.rdb.HGet(ctx, s.redisKeyForTask(req.GetTaskId()), redisTaskDurableEnsureField).Val(),
+	)
+	fe.WaitForTask(req.GetTaskId())
+	_ = fe.Claim(req.GetTaskId())
+	fe.ResetTasks()
+
+	key := s.redisKeyForTask(req.GetTaskId())
+	require.NoError(t, s.rdb.Expire(ctx, key, time.Hour).Err())
+	before, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+
+	resp, err = s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.False(t, resp.GetCreated())
+	require.False(t, resp.GetCompleted())
+	fe.EnsureTaskNotReceived(req.GetTaskId())
+
+	after, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	ttl, err := s.rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+	require.LessOrEqual(t, ttl, time.Hour)
+}
+
+func TestEnsureTask_RejectsMismatchedImmutablePayload(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, *scpb.EnsureTaskRequest)
+	}{
+		{
+			name: "task",
+			mutate: func(t *testing.T, req *scpb.EnsureTaskRequest) {
+				task := &repb.ExecutionTask{}
+				require.NoError(t, proto.Unmarshal(req.GetSerializedTask(), task))
+				task.ExecutionId += "-different"
+				serializedTask, err := proto.Marshal(task)
+				require.NoError(t, err)
+				req.SerializedTask = serializedTask
+			},
+		},
+		{
+			name: "metadata",
+			mutate: func(t *testing.T, req *scpb.EnsureTaskRequest) {
+				req.Metadata.Priority++
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			s := env.GetSchedulerService().(*SchedulerServer)
+			fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+			fe.Register()
+
+			req := newEnsureTaskRequest(newScheduleRequest(ctx, t, env, scheduleOpts{}))
+			resp, err := s.EnsureTask(ctx, req)
+			require.NoError(t, err)
+			require.True(t, resp.GetCreated())
+			fe.WaitForTask(req.GetTaskId())
+
+			key := s.redisKeyForTask(req.GetTaskId())
+			before, err := s.rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+
+			mismatched := proto.Clone(req).(*scpb.EnsureTaskRequest)
+			testCase.mutate(t, mismatched)
+			_, err = s.EnsureTask(ctx, mismatched)
+			require.True(t, status.IsAlreadyExistsError(err), "error: %s", err)
+
+			after, err := s.rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+		})
+	}
+}
+
+func TestEnsureTask_AfterFinalizeReturnsCompletedWithoutReservation(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	req := newEnsureTaskRequest(newScheduleRequest(ctx, t, env, scheduleOpts{}))
+	resp, err := s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.True(t, resp.GetCreated())
+	fe.WaitForTask(req.GetTaskId())
+	lease := fe.Claim(req.GetTaskId())
+	require.NoError(t, lease.Finalize())
+
+	// Finalization atomically leaves only a compact, bounded tombstone.
+	key := s.redisKeyForTask(req.GetTaskId())
+	fields, err := s.rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1", fields[redisTaskCompletedField])
+	require.Len(t, fields[redisTaskFingerprintField], sha256.Size)
+	require.Len(t, fields, 2)
+	ttl, err := s.rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+	require.LessOrEqual(t, ttl, taskCompletionTTL)
+
+	exists, err := s.ExistsTask(ctx, req.GetTaskId())
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	// This is the critical recovery interleaving: the coordinator observed
+	// completion, the executor finalized, and only then recovery calls Ensure.
+	const shortenedTTL = 5 * time.Minute
+	require.NoError(t, s.rdb.Expire(ctx, key, shortenedTTL).Err())
+	fe.ResetTasks()
+	resp, err = s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.False(t, resp.GetCreated())
+	require.True(t, resp.GetCompleted())
+	fe.EnsureTaskNotReceived(req.GetTaskId())
+	ttl, err = s.rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+	require.LessOrEqual(t, ttl, shortenedTTL)
+
+	// A completed task ID stays bound to its immutable fingerprint.
+	mismatched := proto.Clone(req).(*scpb.EnsureTaskRequest)
+	mismatched.Metadata.Priority++
+	_, err = s.EnsureTask(ctx, mismatched)
+	require.True(t, status.IsAlreadyExistsError(err), "error: %s", err)
+
+	// Neither legacy scheduling nor cancellation may overwrite/remove a live
+	// completion tombstone.
+	_, err = s.ScheduleTask(ctx, &scpb.ScheduleTaskRequest{
+		TaskId:         req.GetTaskId(),
+		Metadata:       req.GetMetadata(),
+		SerializedTask: req.GetSerializedTask(),
+	})
+	require.True(t, status.IsAlreadyExistsError(err), "error: %s", err)
+	deleted, err := s.CancelTask(ctx, req.GetTaskId())
+	require.NoError(t, err)
+	require.False(t, deleted)
+
+	_, err = s.claimTask(ctx, req.GetTaskId(), "", true)
+	require.True(t, status.IsNotFoundError(err), "error: %s", err)
+}
+
+func TestEnsureTask_ConcurrentWithFinalizeCannotRecreateTask(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	req := newEnsureTaskRequest(newScheduleRequest(ctx, t, env, scheduleOpts{}))
+	_, err := s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	fe.WaitForTask(req.GetTaskId())
+	lease := fe.Claim(req.GetTaskId())
+
+	start := make(chan struct{})
+	ensureResult := make(chan error, 1)
+	finalizeResult := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := s.EnsureTask(ctx, req)
+		ensureResult <- err
+	}()
+	go func() {
+		<-start
+		finalizeResult <- lease.Finalize()
+	}()
+	close(start)
+
+	require.NoError(t, <-ensureResult)
+	require.NoError(t, <-finalizeResult)
+
+	// Regardless of which Lua operation won the race, finalization is terminal.
+	resp, err := s.EnsureTask(ctx, req)
+	require.NoError(t, err)
+	require.True(t, resp.GetCompleted())
+	_, err = s.claimTask(ctx, req.GetTaskId(), "", true)
+	require.True(t, status.IsNotFoundError(err), "error: %s", err)
+
+	fields, err := s.rdb.HGetAll(ctx, s.redisKeyForTask(req.GetTaskId())).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1", fields[redisTaskCompletedField])
+	require.Len(t, fields[redisTaskFingerprintField], sha256.Size)
+	require.Len(t, fields, 2)
+}
+
+func TestEnsureTask_ConcurrentIdenticalCallsCreateOnce(t *testing.T) {
+	s, ctx := getScheduleServer(t, false, false, "user1")
+	req := newScheduleRequest(ctx, t, s.env, scheduleOpts{})
+
+	const concurrency = 32
+	start := make(chan struct{})
+	errs := make(chan error, concurrency)
+	var createdCount atomic.Int32
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			state, err := s.ensureTask(ctx, req.GetTaskId(), req.GetMetadata(), req.GetSerializedTask())
+			if state == ensureTaskCreated {
+				createdCount.Add(1)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(1), createdCount.Load())
+	task, err := s.readTask(ctx, req.GetTaskId())
+	require.NoError(t, err)
+	require.Equal(t, req.GetSerializedTask(), task.serializedTask)
+	require.Equal(t, int64(0), task.attemptCount)
 }
 
 func TestEnqueueTaskReservation_RoutingConfig(t *testing.T) {
